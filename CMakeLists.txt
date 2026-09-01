@@ -1,0 +1,63 @@
+cmake_minimum_required(VERSION 3.20)
+project(fastgit VERSION 0.1.0 LANGUAGES C)
+
+set(CMAKE_C_STANDARD 23)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)
+
+option(FASTGIT_BUILD_SHARED "Build shared library" ON)
+option(FASTGIT_BUILD_STATIC "Build static library" ON)
+option(FASTGIT_BUILD_TESTS "Build tests" ON)
+option(FASTGIT_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(FASTGIT_ENABLE_LTO "Enable LTO" ON)
+option(FASTGIT_USE_OPENSSL "Use OpenSSL for crypto acceleration" ON)
+option(FASTGIT_USE_SIMD "Use SIMD acceleration" ON)
+
+find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
+if(FASTGIT_USE_OPENSSL)
+    find_package(OpenSSL QUIET)
+endif()
+
+# Platform feature detection
+if(APPLE)
+    add_compile_definitions(FASTGIT_HAVE_KQUEUE=1)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+        add_compile_definitions(FASTGIT_HAVE_NEON=1)
+    endif()
+    if(FASTGIT_USE_SIMD)
+        add_compile_definitions(FASTGIT_HAVE_NEON=1)
+    endif()
+elseif(WIN32)
+    add_compile_definitions(FASTGIT_HAVE_IOCP=1)
+elseif(UNIX)
+    add_compile_definitions(FASTGIT_HAVE_IO_URING=1)
+endif()
+
+if(FASTGIT_USE_OPENSSL AND OpenSSL_FOUND)
+    add_compile_definitions(FASTGIT_HAVE_OPENSSL=1)
+endif()
+
+# Global compile options matching previous build
+add_compile_options(-Wall -Wextra -Wpedantic -Werror -O3 -march=native)
+if(FASTGIT_ENABLE_LTO)
+    add_compile_options(-flto=thin)
+    add_link_options(-flto=thin)
+endif()
+
+# ARM64 arch flag on Apple Silicon
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+    add_compile_options(-arch arm64)
+    add_link_options(-arch arm64)
+endif()
+
+add_subdirectory(src)
+
+if(FASTGIT_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+if(FASTGIT_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
