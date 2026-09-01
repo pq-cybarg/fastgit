@@ -38,6 +38,18 @@ if(FASTGIT_USE_OPENSSL AND OpenSSL_FOUND)
     add_compile_definitions(FASTGIT_HAVE_OPENSSL=1)
 endif()
 
+find_package(CURL QUIET)
+if(CURL_FOUND)
+    add_compile_definitions(FASTGIT_HAVE_CURL=1)
+endif()
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBSSH QUIET libssh)
+    if(LIBSSH_FOUND)
+        add_compile_definitions(FASTGIT_HAVE_LIBSSH=1)
+    endif()
+endif()
+
 # Global compile options matching previous build
 add_compile_options(-Wall -Wextra -Wpedantic -Werror -O3 -march=native)
 if(FASTGIT_ENABLE_LTO)

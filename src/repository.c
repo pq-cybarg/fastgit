@@ -85,9 +85,12 @@ fastgit_error_t fastgit_repository_init(const char* path, bool bare, fastgit_rep
             repo->index = NULL;
         }
     }
-    // worktree only for non-bare
+    // worktree only for non-bare – share the same index object so bench_full Add→Diff is coherent
     if (!bare) {
         fastgit_worktree_new(path, &repo->worktree);
+        if (repo->worktree && repo->index) {
+            fastgit_worktree_attach_index(repo->worktree, repo->index);
+        }
     }
     *out = repo;
     return FASTGIT_OK;
@@ -122,16 +125,21 @@ fastgit_error_t fastgit_repository_open(const char* path, fastgit_repository_t**
             repo->index->path = strdup(idx_path);
         }
     }
-    if (!repo->bare) fastgit_worktree_open(path, &repo->worktree);
+    if (!repo->bare) {
+        fastgit_worktree_open(path, &repo->worktree);
+        if (repo->worktree && repo->index) {
+            fastgit_worktree_attach_index(repo->worktree, repo->index);
+        }
+    }
     *out = repo;
     return FASTGIT_OK;
 }
 
 fastgit_error_t fastgit_repository_free(fastgit_repository_t* repo) {
     if (!repo) return FASTGIT_OK;
-    if (repo->odb) fastgit_odb_free(repo->odb);
-    if (repo->index) fastgit_index_free(repo->index);
     if (repo->worktree) fastgit_worktree_free(repo->worktree);
+    if (repo->index) fastgit_index_free(repo->index);
+    if (repo->odb) fastgit_odb_free(repo->odb);
     free(repo->path);
     free(repo->gitdir);
     free(repo);

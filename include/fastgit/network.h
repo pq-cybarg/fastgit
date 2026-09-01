@@ -127,7 +127,51 @@ typedef struct {
     bool hybrid;
 } fastgit_pqc_config_t;
 
+typedef struct {
+    uint32_t max_retries;
+    uint32_t base_ms;
+    uint32_t max_ms;
+    double jitter_ratio;
+    uint32_t retry_budget_per_min;
+} fastgit_retry_policy_t;
+
+typedef struct {
+    uint32_t failure_threshold;
+    uint32_t success_threshold;
+    uint64_t open_ms;
+    uint64_t half_open_ms;
+} fastgit_circuit_breaker_t;
+
+typedef struct {
+    uint32_t max_concurrent;
+    uint32_t queue_depth;
+    uint32_t shed_threshold_pct;
+} fastgit_load_shed_t;
+
 fastgit_error_t fastgit_remote_set_pqc_config(fastgit_remote_t* remote, const fastgit_pqc_config_t* config);
+fastgit_error_t fastgit_remote_set_retry_policy(fastgit_remote_t* remote, const fastgit_retry_policy_t* policy);
+fastgit_error_t fastgit_remote_set_circuit_breaker(fastgit_remote_t* remote, const fastgit_circuit_breaker_t* cb);
+fastgit_error_t fastgit_remote_set_load_shed(fastgit_remote_t* remote, const fastgit_load_shed_t* ls);
+
+// Transport lifecycle (HTTP/SSH) — implemented in smart_http.c / ssh.c
+fastgit_error_t fastgit_http_transport_new(fastgit_remote_t* remote, fastgit_transport_t** out);
+void fastgit_http_transport_free(fastgit_transport_t* transport);
+uint64_t fastgit_http_last_retry_after_ms(fastgit_transport_t* transport);
+bool fastgit_http_has_valid_token(fastgit_transport_t* transport);
+fastgit_error_t fastgit_http_set_token(fastgit_transport_t* transport, const char* token, uint64_t expiry_ms);
+fastgit_error_t fastgit_http_get_info_refs(fastgit_transport_t* transport, const char* service);
+fastgit_error_t fastgit_http_post_upload_pack(fastgit_transport_t* transport, const void* body, size_t len);
+const char* fastgit_http_response_data(fastgit_transport_t* transport, size_t* out_len);
+long fastgit_http_last_status(fastgit_transport_t* transport);
+
+fastgit_error_t fastgit_ssh_transport_new(fastgit_remote_t* remote, fastgit_transport_t** out);
+void fastgit_ssh_transport_free(fastgit_transport_t* transport);
+#if defined(FASTGIT_HAVE_LIBSSH) && FASTGIT_HAVE_LIBSSH
+fastgit_error_t fastgit_ssh_connect(fastgit_transport_t* transport, const fastgit_cred_data_t* cred);
+fastgit_error_t fastgit_ssh_exec_upload_pack(fastgit_transport_t* transport, const char* git_cmd);
+fastgit_error_t fastgit_ssh_channel_read(fastgit_transport_t* transport, void* buf, size_t len, size_t* out_read);
+fastgit_error_t fastgit_ssh_channel_write(fastgit_transport_t* transport, const void* buf, size_t len);
+#endif
 
 #ifdef __cplusplus
 }

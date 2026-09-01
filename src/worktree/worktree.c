@@ -28,6 +28,7 @@ struct fastgit_worktree {
     char* gitdir;
     fastgit_repository_t* repo;
     fastgit_index_t* index;
+    bool index_owned;
     fastgit_odb_t* odb;
 };
 
@@ -54,6 +55,7 @@ fastgit_error_t fastgit_worktree_new(const char* path, fastgit_worktree_t** out)
     /* Ensure worktree has an index so status/diff work without a repo. */
     fastgit_index_new(&wt->index);
     if (wt->index) {
+        wt->index_owned = true;
         free(wt->index->path);
         char idx_path[4096];
         snprintf(idx_path, sizeof(idx_path), "%s/index", wt->gitdir);
@@ -92,6 +94,7 @@ fastgit_error_t fastgit_worktree_open(const char* path, fastgit_worktree_t** out
         fastgit_worktree_free(wt);
         return err;
     }
+    wt->index_owned = true;
 
     char odb_path[1024];
     snprintf(odb_path, sizeof(odb_path), "%s/objects", wt->gitdir);
@@ -107,11 +110,19 @@ fastgit_error_t fastgit_worktree_open(const char* path, fastgit_worktree_t** out
 
 void fastgit_worktree_free(fastgit_worktree_t* wt) {
     if (!wt) return;
-    if (wt->index) fastgit_index_free(wt->index);
+    if (wt->index && wt->index_owned) fastgit_index_free(wt->index);
     if (wt->odb) fastgit_odb_free(wt->odb);
     free(wt->path);
     free(wt->gitdir);
     free(wt);
+}
+
+fastgit_error_t fastgit_worktree_attach_index(fastgit_worktree_t* wt, fastgit_index_t* index) {
+    if (!wt || !index) return FASTGIT_EINVAL;
+    if (wt->index && wt->index_owned) fastgit_index_free(wt->index);
+    wt->index = index;
+    wt->index_owned = false;
+    return FASTGIT_OK;
 }
 
 const char* fastgit_worktree_path(fastgit_worktree_t* wt) {
@@ -210,6 +221,20 @@ static fastgit_error_t status_compare_entry(fastgit_worktree_t* wt, const fastgi
         return FASTGIT_OK;
     }
 
+    /* racily-clean: if mtime + size match index, assume clean without hashing (git optimization) */
+    if ((uint32_t)st.st_mtime == entry->mtime_sec && (uint32_t)st.st_size == entry->size && st.st_size != 0) {
+        *out = calloc(1, sizeof(fastgit_status_entry_t));
+        if (!*out) return FASTGIT_ENOMEM;
+        (*out)->path = strdup(entry->path);
+        (*out)->index_oid = entry->oid;
+        (*out)->worktree_oid = entry->oid;
+        (*out)->index_mode = entry->mode;
+        (*out)->worktree_mode = st.st_mode & 0777;
+        (*out)->index_status = FASTGIT_STATUS_CURRENT;
+        (*out)->worktree_status = FASTGIT_STATUS_CURRENT;
+        return FASTGIT_OK;
+    }
+
     int fd = open(full_path, O_RDONLY);
     if (fd < 0) {
         *out = calloc(1, sizeof(fastgit_status_entry_t));
@@ -226,16 +251,32 @@ static fastgit_error_t status_compare_entry(fastgit_worktree_t* wt, const fastgi
     fstat(fd, &fst);
     size_t file_size = fst.st_size;
 
-    void* data = malloc(file_size);
+    /* second mtime/size check using fresh fstat in case of race */
+    if ((uint32_t)fst.st_mtime == entry->mtime_sec && (uint32_t)fst.st_size == entry->size && fst.st_size != 0) {
+        close(fd);
+        *out = calloc(1, sizeof(fastgit_status_entry_t));
+        if (!*out) return FASTGIT_ENOMEM;
+        (*out)->path = strdup(entry->path);
+        (*out)->index_oid = entry->oid;
+        (*out)->worktree_oid = entry->oid;
+        (*out)->index_mode = entry->mode;
+        (*out)->worktree_mode = st.st_mode & 0777;
+        (*out)->index_status = FASTGIT_STATUS_CURRENT;
+        (*out)->worktree_status = FASTGIT_STATUS_CURRENT;
+        return FASTGIT_OK;
+    }
+
+    void* data = malloc(file_size ? file_size : 1);
     if (!data) {
         close(fd);
         return FASTGIT_ENOMEM;
     }
 
-    ssize_t n = read(fd, data, file_size);
+    ssize_t n = 0;
+    if (file_size > 0) n = read(fd, data, file_size);
     close(fd);
 
-    if (n != (ssize_t)file_size) {
+    if (file_size > 0 && n != (ssize_t)file_size) {
         free(data);
         return FASTGIT_EIO;
     }
@@ -385,6 +426,32 @@ static void diff_append(char** buf, size_t* len, size_t* cap, const char* str, s
 
 fastgit_error_t fastgit_diff_worktree(fastgit_worktree_t* wt, const char* path, char** out) {
     if (!wt || !out) return FASTGIT_EINVAL;
+    if (path) {
+        fastgit_index_entry_t* entry = NULL;
+        if (wt->index) fastgit_index_find(wt->index, path, FASTGIT_INDEX_STAGE_NORMAL, &entry);
+        if (entry) {
+            fastgit_status_entry_t* se = NULL;
+            fastgit_error_t err = status_compare_entry(wt, entry, &se);
+            if (err != FASTGIT_OK) return err;
+            char* diff = NULL;
+            size_t diff_len = 0, diff_cap = 0;
+            if (se->index_status != FASTGIT_STATUS_CURRENT || se->worktree_status != FASTGIT_STATUS_CURRENT) {
+                char header[512];
+                int hlen = snprintf(header, sizeof(header), "diff --git a/%s b/%s\n", se->path, se->path);
+                if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
+                hlen = snprintf(header, sizeof(header), "index %06o..%06o\n", se->index_mode & 0777, se->worktree_mode & 0777);
+                if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
+                hlen = snprintf(header, sizeof(header), "--- a/%s\n+++ b/%s\n", se->path, se->path);
+                if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
+            } else {
+                diff = calloc(1, 1);
+            }
+            free(se->path);
+            free(se);
+            *out = diff;
+            return FASTGIT_OK;
+        }
+    }
 
     fastgit_status_entry_t* status_entries;
     size_t status_count;

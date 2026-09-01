@@ -43,6 +43,7 @@ struct fastgit_status_entry {
 fastgit_error_t fastgit_worktree_new(const char* path, fastgit_worktree_t** out);
 fastgit_error_t fastgit_worktree_open(const char* path, fastgit_worktree_t** out);
 void fastgit_worktree_free(fastgit_worktree_t* wt);
+fastgit_error_t fastgit_worktree_attach_index(fastgit_worktree_t* wt, fastgit_index_t* index);
 
 const char* fastgit_worktree_path(fastgit_worktree_t* wt);
 const char* fastgit_worktree_gitdir(fastgit_worktree_t* wt);
