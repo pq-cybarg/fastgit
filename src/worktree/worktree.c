@@ -3,6 +3,7 @@
 #include "fastgit/index.h"
 #include "fastgit/odb.h"
 #include "fastgit/hash.h"
+#include "fastgit/platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -312,15 +313,58 @@ static fastgit_error_t status_compare_entry(fastgit_worktree_t* wt, const fastgi
     return FASTGIT_OK;
 }
 
+typedef struct { fastgit_worktree_t* wt; const fastgit_index_entry_t* entry; fastgit_status_entry_t out; fastgit_error_t err; } status_task_t;
+static void status_task_fn(void* arg) {
+    status_task_t* t = (status_task_t*)arg;
+    fastgit_status_entry_t* se = NULL;
+    t->err = status_compare_entry(t->wt, t->entry, &se);
+    if (t->err == FASTGIT_OK && se) { t->out = *se; free(se); } else { memset(&t->out, 0, sizeof(t->out)); }
+}
+
 fastgit_error_t fastgit_status(fastgit_worktree_t* wt, fastgit_status_entry_t** entries, size_t* count) {
     if (!wt || !entries || !count) return FASTGIT_EINVAL;
     if (!wt->index) return FASTGIT_EINVAL;
 
-    size_t capacity = fastgit_index_entry_count(wt->index) + 1024;
+    size_t n = fastgit_index_entry_count(wt->index);
+    size_t capacity = n + 1024;
     fastgit_status_entry_t* status_entries = calloc(capacity, sizeof(fastgit_status_entry_t));
     if (!status_entries) return FASTGIT_ENOMEM;
 
     size_t status_count = 0;
+
+    if (n >= 128) {
+        status_task_t* tasks = calloc(n, sizeof(status_task_t));
+        size_t task_n = 0;
+        for (size_t i = 0; i < n; i++) {
+            const fastgit_index_entry_t* e = fastgit_index_entry_by_index(wt->index, i);
+            if (e->stage != FASTGIT_INDEX_STAGE_NORMAL) continue;
+            tasks[task_n].wt = wt;
+            tasks[task_n].entry = e;
+            tasks[task_n].err = FASTGIT_OK;
+            task_n++;
+        }
+        fastgit_thread_pool_t* pool = NULL;
+        size_t workers = task_n < 16 ? task_n : 16;
+        fastgit_thread_pool_config_t pcfg = {0};
+        pcfg.worker_count = (int)workers;
+        pcfg.max_queue_depth = (int)task_n + 4;
+        if (workers > 0 && fastgit_thread_pool_new(&pcfg, &pool) == FASTGIT_OK) {
+            for (size_t i = 0; i < task_n; i++) fastgit_thread_pool_submit(pool, status_task_fn, &tasks[i]);
+            fastgit_thread_pool_wait(pool);
+            fastgit_thread_pool_free(pool);
+            bool ok = true;
+            for (size_t i = 0; i < task_n; i++) if (tasks[i].err != FASTGIT_OK) ok = false;
+            if (ok) {
+                for (size_t i = 0; i < task_n; i++) status_entries[status_count++] = tasks[i].out;
+                free(tasks);
+                goto untracked;
+            }
+            for (size_t i = 0; i < task_n; i++) free(tasks[i].out.path);
+        }
+        free(tasks);
+        /* fallback to sequential */
+        status_count = 0;
+    }
 
     for (size_t i = 0; i < fastgit_index_entry_count(wt->index); i++) {
         const fastgit_index_entry_t* entry = fastgit_index_entry_by_index(wt->index, i);
@@ -354,6 +398,7 @@ fastgit_error_t fastgit_status(fastgit_worktree_t* wt, fastgit_status_entry_t** 
         status_entries[status_count++] = *status_entry;
         free(status_entry);
     }
+untracked:;
 
     DIR* dir = opendir(wt->path);
     if (dir) {
@@ -368,14 +413,8 @@ fastgit_error_t fastgit_status(fastgit_worktree_t* wt, fastgit_status_entry_t** 
             if (stat(full_path, &st) < 0) continue;
             if (!S_ISREG(st.st_mode)) continue;
 
-            bool in_index = false;
-            for (size_t i = 0; i < fastgit_index_entry_count(wt->index); i++) {
-                const fastgit_index_entry_t* entry = fastgit_index_entry_by_index(wt->index, i);
-                if (strcmp(entry->path, de->d_name) == 0) {
-                    in_index = true;
-                    break;
-                }
-            }
+            fastgit_index_entry_t* found = NULL;
+            bool in_index = (fastgit_index_find(wt->index, de->d_name, FASTGIT_INDEX_STAGE_NORMAL, &found) == FASTGIT_OK);
 
             if (!in_index) {
                 if (status_count >= capacity) {

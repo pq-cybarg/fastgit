@@ -20,8 +20,20 @@
 #endif
 
 #define FASTGIT_ODB_LOOSE_DIR_MODE 0755
-#define FASTGIT_ODB_COMPRESSION_LEVEL 3
+#define FASTGIT_ODB_COMPRESSION_LEVEL 1
+#define FASTGIT_ODB_CACHE_BITS 14
+#define FASTGIT_ODB_CACHE_SIZE (1u << FASTGIT_ODB_CACHE_BITS)
+#define FASTGIT_ODB_CACHE_MASK (FASTGIT_ODB_CACHE_SIZE - 1)
 static size_t obj_size_hint(size_t csize) { return csize * 4 + 128; }
+
+typedef struct {
+    fastgit_oid_t oid;
+    fastgit_obj_type_t type;
+    void* data;
+    size_t size;
+    uint64_t gen;
+    bool occupied;
+} odb_cache_entry_t;
 
 struct fastgit_odb {
     char* path;
@@ -34,6 +46,10 @@ struct fastgit_odb {
     uint64_t stats_writes;
     uint64_t stats_cache_hits;
     uint64_t stats_cache_misses;
+
+    odb_cache_entry_t* cache;
+    uint64_t cache_gen;
+    bool algo_dir_ready;
 };
 
 static char* odb_object_path(fastgit_odb_t* odb, const fastgit_oid_t* oid) {
@@ -53,24 +69,19 @@ static char* odb_object_path(fastgit_odb_t* odb, const fastgit_oid_t* oid) {
 static fastgit_error_t odb_ensure_dir(fastgit_odb_t* odb, const fastgit_oid_t* oid) {
     char algo_dir[4];
     snprintf(algo_dir, sizeof(algo_dir), "%02x", oid->algo);
-
     char hex[129];
     fastgit_oid_to_hex(oid, hex, sizeof(hex));
-
     char dir_path[1024];
     char algo_path[1024];
     snprintf(algo_path, sizeof(algo_path), "%s/objects/%s", odb->path, algo_dir);
     snprintf(dir_path, sizeof(dir_path), "%s/objects/%s/%s", odb->path, algo_dir, hex);
-
 #if defined(_WIN32)
     CreateDirectoryA(algo_path, NULL);
     CreateDirectoryA(dir_path, NULL);
     return FASTGIT_OK;
 #else
-    mkdir(algo_path, FASTGIT_ODB_LOOSE_DIR_MODE);
-    if (mkdir(dir_path, FASTGIT_ODB_LOOSE_DIR_MODE) == 0 || errno == EEXIST) {
-        return FASTGIT_OK;
-    }
+    if (!odb->algo_dir_ready) { mkdir(algo_path, FASTGIT_ODB_LOOSE_DIR_MODE); odb->algo_dir_ready = true; }
+    if (mkdir(dir_path, FASTGIT_ODB_LOOSE_DIR_MODE) == 0 || errno == EEXIST) return FASTGIT_OK;
     return FASTGIT_EIO;
 #endif
 }
@@ -132,6 +143,13 @@ static __attribute__((unused)) fastgit_error_t odb_decompress(const void* data, 
 #endif
 }
 
+static inline uint32_t odb_hash_oid(const fastgit_oid_t* oid) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < oid->len && i < 8; i++) { h ^= oid->hash[i]; h *= 16777619u; }
+    h ^= oid->algo; h *= 16777619u;
+    return h;
+}
+
 fastgit_error_t fastgit_odb_new(const char* path, fastgit_odb_t** out) {
     if (!path || !out) return FASTGIT_EINVAL;
 
@@ -152,6 +170,13 @@ fastgit_error_t fastgit_odb_new(const char* path, fastgit_odb_t** out) {
         free(odb);
         return FASTGIT_ENOMEM;
     }
+    odb->cache = calloc(FASTGIT_ODB_CACHE_SIZE, sizeof(odb_cache_entry_t));
+    if (!odb->cache) {
+        free(odb->backends); free(odb->path); free(odb);
+        return FASTGIT_ENOMEM;
+    }
+    odb->cache_gen = 1;
+    odb->algo_dir_ready = false;
 
     char objects_dir[1024];
     snprintf(objects_dir, sizeof(objects_dir), "%s/objects", path);
@@ -171,6 +196,10 @@ fastgit_error_t fastgit_odb_open(const char* path, fastgit_odb_t** out) {
 
 void fastgit_odb_free(fastgit_odb_t* odb) {
     if (!odb) return;
+    if (odb->cache) {
+        for (size_t i = 0; i < FASTGIT_ODB_CACHE_SIZE; i++) if (odb->cache[i].occupied) free(odb->cache[i].data);
+        free(odb->cache);
+    }
     free(odb->path);
     free(odb->backends);
     free(odb);
@@ -178,15 +207,25 @@ void fastgit_odb_free(fastgit_odb_t* odb) {
 
 fastgit_error_t fastgit_odb_read(fastgit_odb_t* odb, const fastgit_oid_t* oid, fastgit_odb_object_t* out) {
     if (!odb || !oid || !out) return FASTGIT_EINVAL;
-
     odb->stats_reads++;
-
+    if (odb->cache) {
+        uint32_t h = odb_hash_oid(oid) & FASTGIT_ODB_CACHE_MASK;
+        for (size_t probe = 0; probe < 8; probe++) {
+            size_t idx = (h + probe) & FASTGIT_ODB_CACHE_MASK;
+            odb_cache_entry_t* e = &odb->cache[idx];
+            if (!e->occupied) break;
+            if (e->oid.len == oid->len && e->oid.algo == oid->algo && memcmp(e->oid.hash, oid->hash, oid->len) == 0) {
+                void* cpy = malloc(e->size ? e->size : 1);
+                if (!cpy) return FASTGIT_ENOMEM;
+                if (e->size) memcpy(cpy, e->data, e->size);
+                out->oid = *oid; out->type = e->type; out->size = e->size; out->data = cpy; out->source = FASTGIT_ODB_LOOSE;
+                odb->stats_cache_hits++; return FASTGIT_OK;
+            }
+        }
+    }
     for (size_t i = 0; i < odb->backend_count; i++) {
         fastgit_error_t err = fastgit_odb_read(odb->backends[i], oid, out);
-        if (err == FASTGIT_OK) {
-            odb->stats_cache_hits++;
-            return FASTGIT_OK;
-        }
+        if (err == FASTGIT_OK) { odb->stats_cache_hits++; return FASTGIT_OK; }
     }
 
     char* path = odb_object_path(odb, oid);
@@ -288,8 +327,20 @@ fastgit_error_t fastgit_odb_read(fastgit_odb_t* odb, const fastgit_oid_t* oid, f
     out->size = obj_size;
     out->data = data;
     out->source = FASTGIT_ODB_LOOSE;
-
     odb->stats_cache_misses++;
+    if (odb->cache) {
+        uint32_t h = odb_hash_oid(oid) & FASTGIT_ODB_CACHE_MASK;
+        for (size_t probe = 0; probe < 8; probe++) {
+            size_t idx = (h + probe) & FASTGIT_ODB_CACHE_MASK;
+            odb_cache_entry_t* e = &odb->cache[idx];
+            if (!e->occupied) {
+                void* cpy = malloc(obj_size ? obj_size : 1);
+                if (cpy) { if (obj_size) memcpy(cpy, data, obj_size); e->oid=*oid; e->type=type; e->size=obj_size; e->data=cpy; e->gen=odb->cache_gen++; e->occupied=true; }
+                break;
+            }
+            if (e->oid.len==oid->len && e->oid.algo==oid->algo && memcmp(e->oid.hash,oid->hash,oid->len)==0) break;
+        }
+    }
     return FASTGIT_OK;
 }
 
@@ -305,17 +356,22 @@ fastgit_error_t fastgit_odb_read_header(fastgit_odb_t* odb, const fastgit_oid_t*
 
 fastgit_error_t fastgit_odb_write(fastgit_odb_t* odb, fastgit_obj_type_t type, const void* data, size_t len, fastgit_oid_t* out) {
     if (!odb || !data || !out) return FASTGIT_EINVAL;
-
     odb->stats_writes++;
-
     fastgit_object_t temp_obj;
-    temp_obj.type = type;
-    temp_obj.size = len;
-    temp_obj.data = (void*)data;
-    temp_obj.free_data = NULL;
-
+    temp_obj.type = type; temp_obj.size = len; temp_obj.data = (void*)data; temp_obj.free_data = NULL;
     fastgit_error_t err = fastgit_object_hash(&temp_obj, odb->default_hash_algo, out);
     if (err != FASTGIT_OK) return err;
+    if (odb->cache) {
+        uint32_t h = odb_hash_oid(out) & FASTGIT_ODB_CACHE_MASK;
+        for (size_t probe = 0; probe < 8; probe++) {
+            size_t idx = (h + probe) & FASTGIT_ODB_CACHE_MASK;
+            odb_cache_entry_t* e = &odb->cache[idx];
+            if (e->occupied && e->oid.len==out->len && e->oid.algo==out->algo && memcmp(e->oid.hash,out->hash,out->len)==0) {
+                odb->stats_cache_hits++; return FASTGIT_OK;
+            }
+            if (!e->occupied) break;
+        }
+    }
 
     fastgit_buf_t buf;
     err = fastgit_object_serialize(&temp_obj, odb->default_hash_algo, &buf);
@@ -372,6 +428,22 @@ fastgit_error_t fastgit_odb_write(fastgit_odb_t* odb, fastgit_obj_type_t type, c
 
     free(compressed);
     free(path);
+    if (odb->cache) {
+        uint32_t h = odb_hash_oid(out) & FASTGIT_ODB_CACHE_MASK;
+        for (size_t probe = 0; probe < 8; probe++) {
+            size_t idx = (h + probe) & FASTGIT_ODB_CACHE_MASK;
+            odb_cache_entry_t* e = &odb->cache[idx];
+            if (!e->occupied) {
+                void* cpy = malloc(len ? len : 1);
+                if (cpy) { if (len) memcpy(cpy, data, len); e->oid=*out; e->type=type; e->size=len; e->data=cpy; e->gen=odb->cache_gen++; e->occupied=true; }
+                break;
+            }
+            if (e->oid.len==out->len && e->oid.algo==out->algo && memcmp(e->oid.hash,out->hash,out->len)==0) {
+                free(e->data); void* cpy=malloc(len?len:1); if(cpy){ if(len) memcpy(cpy,data,len); e->data=cpy; e->size=len; e->type=type; e->gen=odb->cache_gen++; }
+                break;
+            }
+        }
+    }
     return FASTGIT_OK;
 }
 

@@ -107,6 +107,7 @@ fastgit_error_t fastgit_index_write(fastgit_index_t* index);
 fastgit_error_t fastgit_index_write_to(fastgit_index_t* index, const char* path);
 
 fastgit_error_t fastgit_index_add(fastgit_index_t* index, const char* path);
+fastgit_error_t fastgit_index_add_many(fastgit_index_t* index, const char** paths, size_t count);
 fastgit_error_t fastgit_index_add_from_buffer(fastgit_index_t* index, const char* path, uint32_t mode, const void* data, size_t len);
 fastgit_error_t fastgit_index_remove(fastgit_index_t* index, const char* path, uint32_t stage);
 fastgit_error_t fastgit_index_clear(fastgit_index_t* index);

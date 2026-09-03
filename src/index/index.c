@@ -1,6 +1,7 @@
 #include "fastgit/index.h"
 #include "fastgit/object.h"
 #include "fastgit/hash.h"
+#include "fastgit/platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -343,48 +344,202 @@ fastgit_error_t fastgit_index_write_to(fastgit_index_t* index, const char* path)
 fastgit_error_t fastgit_index_add(fastgit_index_t* index, const char* path) {
     if (!index || !path) return FASTGIT_EINVAL;
 
-    struct stat st;
-    if (index->vfs.stat(path, &st) < 0) return FASTGIT_ENOENT;
-
     int fd = index->vfs.open(path, O_RDONLY);
-    if (fd < 0) return FASTGIT_EIO;
+    if (fd < 0) return FASTGIT_ENOENT;
 
     struct stat fst;
     index->vfs.fstat(fd, &fst);
-
-    size_t file_size = fst.st_size;
-    void* data = malloc(file_size);
-    if (!data) {
-        index->vfs.close(fd);
-        return FASTGIT_ENOMEM;
+    size_t file_size = (size_t)fst.st_size;
+    void* data = NULL;
+    if (file_size > 0) {
+        data = malloc(file_size);
+        if (!data) {
+            index->vfs.close(fd);
+            return FASTGIT_ENOMEM;
+        }
+        ssize_t n = index->vfs.read(fd, data, file_size);
+        if (n != (ssize_t)file_size) {
+            free(data);
+            index->vfs.close(fd);
+            return FASTGIT_EIO;
+        }
     }
-
-    ssize_t n = index->vfs.read(fd, data, file_size);
     index->vfs.close(fd);
 
-    if (n != (ssize_t)file_size) {
-        free(data);
-        return FASTGIT_EIO;
-    }
-
     fastgit_hash_t hash;
-    fastgit_error_t err = fastgit_hash(FASTGIT_HASH_SHA256, data, file_size, &hash);
+    fastgit_error_t err;
+    if (file_size == 0) {
+        err = fastgit_hash(FASTGIT_HASH_SHA256, "", 0, &hash);
+    } else {
+        err = fastgit_hash(FASTGIT_HASH_SHA256, data, file_size, &hash);
+    }
+    if (err != FASTGIT_OK) {
+        free(data);
+        return err;
+    }
     free(data);
-    if (err != FASTGIT_OK) return err;
 
-    fastgit_object_t* blob;
-    err = fastgit_blob_create_from_file(path, &blob);
-    if (err != FASTGIT_OK) return err;
-
-    fastgit_oid_t blob_oid;
-    err = fastgit_object_hash(blob, FASTGIT_HASH_SHA256, &blob_oid);
-    fastgit_object_free(blob);
-    if (err != FASTGIT_OK) return err;
+    fastgit_oid_t oid;
+    oid.algo = FASTGIT_HASH_SHA256;
+    oid.len = hash.len;
+    memcpy(oid.hash, hash.digest, hash.len);
 
     uint32_t mode = S_IFREG | 0644;
-    if (st.st_mode & S_IXUSR) mode = S_IFREG | 0755;
+    if (fst.st_mode & S_IXUSR) mode = S_IFREG | 0755;
 
-    return fastgit_index_add_from_buffer(index, path, mode, NULL, 0);
+    if (index->count >= index->capacity) {
+        size_t new_cap = index->capacity ? index->capacity * 2 : 1024;
+        fastgit_index_entry_t* new_entries = realloc(index->entries, new_cap * sizeof(fastgit_index_entry_t));
+        if (!new_entries) return FASTGIT_ENOMEM;
+        index->entries = new_entries;
+        index->capacity = new_cap;
+    }
+
+    fastgit_index_entry_t* entry = &index->entries[index->count++];
+    entry->oid = oid;
+    entry->path = strdup(path);
+    if (!entry->path) {
+        index->count--;
+        return FASTGIT_ENOMEM;
+    }
+    entry->mode = mode;
+    entry->stage = FASTGIT_INDEX_STAGE_NORMAL;
+    entry->flags = (uint16_t)(strlen(path) & 0xFFF);
+    entry->flags_extended = 0;
+    entry->ctime_sec = (uint32_t)fst.st_ctime;
+#if defined(__APPLE__)
+    entry->ctime_nsec = 0;
+    entry->mtime_sec = (uint32_t)fst.st_mtime;
+    entry->mtime_nsec = 0;
+#else
+    entry->ctime_nsec = (uint32_t)fst.st_ctim.tv_nsec;
+    entry->mtime_sec = (uint32_t)fst.st_mtim.tv_sec;
+    entry->mtime_nsec = (uint32_t)fst.st_mtim.tv_nsec;
+#endif
+    entry->dev = (uint32_t)fst.st_dev;
+    entry->ino = (uint32_t)fst.st_ino;
+    entry->uid = (uint32_t)fst.st_uid;
+    entry->gid = (uint32_t)fst.st_gid;
+    entry->size = (uint32_t)file_size;
+
+    index->dirty = true;
+    index->sorted = false;
+    return FASTGIT_OK;
+}
+
+typedef struct {
+    const char* path;
+    struct stat fst;
+    fastgit_hash_t hash;
+    fastgit_error_t err;
+    size_t file_size;
+} bulk_task_t;
+
+static void bulk_hash_fn(void* arg) {
+    bulk_task_t* t = (bulk_task_t*)arg;
+    int fd = open(t->path, O_RDONLY);
+    if (fd < 0) { t->err = FASTGIT_ENOENT; return; }
+    if (fstat(fd, &t->fst) != 0) { close(fd); t->err = FASTGIT_EIO; return; }
+    t->file_size = (size_t)t->fst.st_size;
+    fastgit_error_t he = FASTGIT_OK;
+    if (t->file_size == 0) {
+        he = fastgit_hash(FASTGIT_HASH_SHA256, "", 0, &t->hash);
+    } else {
+        void* data = malloc(t->file_size);
+        if (!data) { close(fd); t->err = FASTGIT_ENOMEM; return; }
+        ssize_t n = read(fd, data, t->file_size);
+        close(fd);
+        if (n != (ssize_t)t->file_size) { free(data); t->err = FASTGIT_EIO; return; }
+        he = fastgit_hash(FASTGIT_HASH_SHA256, data, t->file_size, &t->hash);
+        free(data);
+        if (he != FASTGIT_OK) { t->err = he; return; }
+        t->err = FASTGIT_OK;
+        return;
+    }
+    close(fd);
+    t->err = he;
+}
+
+fastgit_error_t fastgit_index_add_many(fastgit_index_t* index, const char** paths, size_t count) {
+    if (!index || !paths) return FASTGIT_EINVAL;
+    if (count == 0) return FASTGIT_OK;
+    if (count == 1) return fastgit_index_add(index, paths[0]);
+
+    bulk_task_t* tasks = calloc(count, sizeof(bulk_task_t));
+    if (!tasks) return FASTGIT_ENOMEM;
+    for (size_t i = 0; i < count; i++) tasks[i].path = paths[i];
+
+    // Try parallel via thread pool, fallback to sequential on failure
+    fastgit_thread_pool_t* pool = NULL;
+    fastgit_thread_pool_config_t cfg = {0};
+    cfg.worker_count = (int)(count < 16 ? count : 16);
+    cfg.max_queue_depth = (int)count + 4;
+    bool use_pool = (fastgit_thread_pool_new(&cfg, &pool) == FASTGIT_OK);
+
+    if (use_pool) {
+        for (size_t i = 0; i < count; i++) {
+            fastgit_thread_pool_submit(pool, bulk_hash_fn, &tasks[i]);
+        }
+        fastgit_thread_pool_wait(pool);
+        fastgit_thread_pool_free(pool);
+    } else {
+        for (size_t i = 0; i < count; i++) bulk_hash_fn(&tasks[i]);
+    }
+
+    // Count successes to grow once
+    size_t ok = 0;
+    for (size_t i = 0; i < count; i++) if (tasks[i].err == FASTGIT_OK) ok++;
+    if (ok == 0) {
+        fastgit_error_t first = tasks[0].err;
+        free(tasks);
+        return first;
+    }
+    if (index->count + ok > index->capacity) {
+        size_t need = index->count + ok;
+        size_t new_cap = index->capacity ? index->capacity : 1024;
+        while (new_cap < need) new_cap *= 2;
+        fastgit_index_entry_t* ne = realloc(index->entries, new_cap * sizeof(fastgit_index_entry_t));
+        if (!ne) { free(tasks); return FASTGIT_ENOMEM; }
+        index->entries = ne;
+        index->capacity = new_cap;
+    }
+    // Bulk insert
+    for (size_t i = 0; i < count; i++) {
+        if (tasks[i].err != FASTGIT_OK) continue;
+        fastgit_oid_t oid;
+        oid.algo = FASTGIT_HASH_SHA256;
+        oid.len = tasks[i].hash.len;
+        memcpy(oid.hash, tasks[i].hash.digest, tasks[i].hash.len);
+        uint32_t mode = S_IFREG | 0644;
+        if (tasks[i].fst.st_mode & S_IXUSR) mode = S_IFREG | 0755;
+        fastgit_index_entry_t* e = &index->entries[index->count++];
+        e->oid = oid;
+        e->path = strdup(tasks[i].path);
+        if (!e->path) { index->count--; continue; }
+        e->mode = mode;
+        e->stage = FASTGIT_INDEX_STAGE_NORMAL;
+        e->flags = (uint16_t)(strlen(tasks[i].path) & 0xFFF);
+        e->flags_extended = 0;
+        e->ctime_sec = (uint32_t)tasks[i].fst.st_ctime;
+#if defined(__APPLE__)
+        e->ctime_nsec = 0;
+        e->mtime_sec = (uint32_t)tasks[i].fst.st_mtime;
+        e->mtime_nsec = 0;
+#else
+        e->ctime_nsec = (uint32_t)tasks[i].fst.st_ctim.tv_nsec;
+        e->mtime_sec = (uint32_t)tasks[i].fst.st_mtim.tv_sec;
+        e->mtime_nsec = (uint32_t)tasks[i].fst.st_mtim.tv_nsec;
+#endif
+        e->dev = (uint32_t)tasks[i].fst.st_dev;
+        e->ino = (uint32_t)tasks[i].fst.st_ino;
+        e->uid = (uint32_t)tasks[i].fst.st_uid;
+        e->gid = (uint32_t)tasks[i].fst.st_gid;
+        e->size = (uint32_t)tasks[i].file_size;
+    }
+    free(tasks);
+    index->dirty = true;
+    index->sorted = false;
+    return FASTGIT_OK;
 }
 
 fastgit_error_t fastgit_index_add_from_buffer(fastgit_index_t* index, const char* path, uint32_t mode, const void* data __attribute__((unused)), size_t len __attribute__((unused))) {
@@ -410,17 +565,15 @@ fastgit_error_t fastgit_index_add_from_buffer(fastgit_index_t* index, const char
     entry->flags = (uint16_t)strlen(path);
     entry->flags_extended = 0;
 
-    struct stat st;
-    index->vfs.stat(path, &st);
-    entry->ctime_sec = st.st_ctime;
+    entry->ctime_sec = 0;
     entry->ctime_nsec = 0;
-    entry->mtime_sec = st.st_mtime;
+    entry->mtime_sec = 0;
     entry->mtime_nsec = 0;
-    entry->dev = st.st_dev;
-    entry->ino = st.st_ino;
-    entry->uid = st.st_uid;
-    entry->gid = st.st_gid;
-    entry->size = st.st_size;
+    entry->dev = 0;
+    entry->ino = 0;
+    entry->uid = 0;
+    entry->gid = 0;
+    entry->size = (uint32_t)len;
 
     index->dirty = true;
     index->sorted = false;

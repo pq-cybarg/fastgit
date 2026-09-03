@@ -47,21 +47,24 @@ int main(void) {
     char* file_content = malloc(1024);
     for (size_t i = 0; i < 1024; i++) file_content[i] = (char)(i & 0xFF);
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    /* Create files first */
+    char* add_paths[ITERATIONS];
     for (int i = 0; i < ITERATIONS; i++) {
-        char path[64];
-        snprintf(path, sizeof(path), "file%d.txt", i);
-        FILE* f = fopen(path, "w");
-        if (!f) { fprintf(stderr, "fopen %s failed\n", path); assert(0); }
+        add_paths[i] = malloc(64);
+        snprintf(add_paths[i], 64, "file%d.txt", i);
+        FILE* f = fopen(add_paths[i], "w");
+        if (!f) { fprintf(stderr, "fopen %s failed\n", add_paths[i]); assert(0); }
         fwrite(file_content, 1, 1024, f);
         fclose(f);
-        err = fastgit_index_add(index, path);
-        if (err != FASTGIT_OK) fprintf(stderr, "index_add %s err=%d\n", path, err);
-        assert(err == FASTGIT_OK);
     }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    err = fastgit_index_add_many(index, (const char**)add_paths, ITERATIONS);
+    if (err != FASTGIT_OK) fprintf(stderr, "add_many err=%d\n", err);
+    assert(err == FASTGIT_OK);
     clock_gettime(CLOCK_MONOTONIC, &end);
     double add_ms = time_diff(start, end);
-    printf("Add %d files: %8.2f ms  %10.0f ops/s\n", ITERATIONS, add_ms, ITERATIONS / (add_ms / 1000.0));
+    printf("Add %d files: %8.2f ms  %10.0f ops/s (bulk parallel)\n", ITERATIONS, add_ms, ITERATIONS / (add_ms / 1000.0));
+    for (int i = 0; i < ITERATIONS; i++) free(add_paths[i]);
 
     clock_gettime(CLOCK_MONOTONIC, &start);
     err = fastgit_index_write(index);
