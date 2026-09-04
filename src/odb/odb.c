@@ -53,34 +53,25 @@ struct fastgit_odb {
 };
 
 static char* odb_object_path(fastgit_odb_t* odb, const fastgit_oid_t* oid) {
-    char algo_dir[4];
-    snprintf(algo_dir, sizeof(algo_dir), "%02x", oid->algo);
-
     char hex[129];
     fastgit_oid_to_hex(oid, hex, sizeof(hex));
-
-    size_t need = (size_t)snprintf(NULL, 0, "%s/objects/%s/%s/%s", odb->path, algo_dir, hex, hex + 2) + 1;
+    // git-compatible loose layout: $GITDIR/objects/ab/cdef... (no algo prefix, no double objects)
+    size_t need = (size_t)snprintf(NULL, 0, "%s/%.2s/%s", odb->path, hex, hex + 2) + 1;
     char* path = malloc(need);
     if (!path) return NULL;
-    snprintf(path, need, "%s/objects/%s/%s/%s", odb->path, algo_dir, hex, hex + 2);
+    snprintf(path, need, "%s/%.2s/%s", odb->path, hex, hex + 2);
     return path;
 }
 
 static fastgit_error_t odb_ensure_dir(fastgit_odb_t* odb, const fastgit_oid_t* oid) {
-    char algo_dir[4];
-    snprintf(algo_dir, sizeof(algo_dir), "%02x", oid->algo);
     char hex[129];
     fastgit_oid_to_hex(oid, hex, sizeof(hex));
     char dir_path[1024];
-    char algo_path[1024];
-    snprintf(algo_path, sizeof(algo_path), "%s/objects/%s", odb->path, algo_dir);
-    snprintf(dir_path, sizeof(dir_path), "%s/objects/%s/%s", odb->path, algo_dir, hex);
+    snprintf(dir_path, sizeof(dir_path), "%s/%.2s", odb->path, hex);
 #if defined(_WIN32)
-    CreateDirectoryA(algo_path, NULL);
     CreateDirectoryA(dir_path, NULL);
     return FASTGIT_OK;
 #else
-    if (!odb->algo_dir_ready) { mkdir(algo_path, FASTGIT_ODB_LOOSE_DIR_MODE); odb->algo_dir_ready = true; }
     if (mkdir(dir_path, FASTGIT_ODB_LOOSE_DIR_MODE) == 0 || errno == EEXIST) return FASTGIT_OK;
     return FASTGIT_EIO;
 #endif
@@ -178,12 +169,10 @@ fastgit_error_t fastgit_odb_new(const char* path, fastgit_odb_t** out) {
     odb->cache_gen = 1;
     odb->algo_dir_ready = false;
 
-    char objects_dir[1024];
-    snprintf(objects_dir, sizeof(objects_dir), "%s/objects", path);
 #if defined(_WIN32)
-    CreateDirectoryA(objects_dir, NULL);
+    CreateDirectoryA(path, NULL);
 #else
-    mkdir(objects_dir, FASTGIT_ODB_LOOSE_DIR_MODE);
+    mkdir(path, FASTGIT_ODB_LOOSE_DIR_MODE);
 #endif
 
     *out = odb;
@@ -499,8 +488,9 @@ fastgit_error_t fastgit_odb_iterator_new(fastgit_odb_t* odb, fastgit_odb_iterato
     fastgit_odb_iterator_t* iter = calloc(1, sizeof(*iter));
     if (!iter) return FASTGIT_ENOMEM;
     iter->odb = odb;
+    // git-compatible 2-level layout: objects/ab/cdef...
     char objects_dir[1024];
-    snprintf(objects_dir, sizeof(objects_dir), "%s/objects", odb->path);
+    snprintf(objects_dir, sizeof(objects_dir), "%s", odb->path);
     DIR* d1 = opendir(objects_dir);
     if (!d1) { iter->oids=NULL; iter->count=0; *out=iter; return FASTGIT_OK; }
     size_t cap=64; iter->oids=malloc(cap*sizeof(fastgit_oid_t));
@@ -508,26 +498,15 @@ fastgit_error_t fastgit_odb_iterator_new(fastgit_odb_t* odb, fastgit_odb_iterato
     struct dirent* e1;
     while ((e1=readdir(d1))!=NULL) {
         if (e1->d_name[0]=='.') continue;
-        char p1[1024]; snprintf(p1,sizeof(p1),"%s/objects/%s",odb->path,e1->d_name);
+        if (strlen(e1->d_name)!=2) continue; // git loose Fan-out is 2 hex chars
+        char p1[1024]; snprintf(p1,sizeof(p1),"%s/%s",odb->path,e1->d_name);
         DIR* d2=opendir(p1); if(!d2) continue;
         struct dirent* e2; while((e2=readdir(d2))!=NULL){
             if(e2->d_name[0]=='.') continue;
-            char p2[1024]; snprintf(p2,sizeof(p2),"%s/objects/%s/%s",odb->path,e1->d_name,e2->d_name);
-            DIR* d3=opendir(p2); if(!d3) continue;
-            struct dirent* e3; while((e3=readdir(d3))!=NULL){
-                if(e3->d_name[0]=='.') continue;
-                char full[256]; snprintf(full,sizeof(full),"%s",e2->d_name);
-                if (strlen(e3->d_name) > 0) {
-                    char check[256]; snprintf(check,sizeof(check),"%s%s",full+2,e3->d_name);
-                    if (strcmp(check, full+2) != 0 && strlen(e3->d_name) != (size_t)(strlen(full)-2)) {
-                        // suffix should be full hex without first 2 chars, but be lenient
-                    }
-                }
-                fastgit_oid_t oid; if(fastgit_oid_from_hex(full,&oid)!=FASTGIT_OK) continue;
-                if(iter->count>=cap){ cap*=2; fastgit_oid_t* n=realloc(iter->oids,cap*sizeof(*n)); if(!n) break; iter->oids=n; }
-                iter->oids[iter->count++]=oid;
-            }
-            closedir(d3);
+            char full[256]; snprintf(full,sizeof(full),"%s%s",e1->d_name,e2->d_name);
+            fastgit_oid_t oid; if(fastgit_oid_from_hex(full,&oid)!=FASTGIT_OK) continue;
+            if(iter->count>=cap){ cap*=2; fastgit_oid_t* n=realloc(iter->oids,cap*sizeof(*n)); if(!n) break; iter->oids=n; }
+            iter->oids[iter->count++]=oid;
         }
         closedir(d2);
     }

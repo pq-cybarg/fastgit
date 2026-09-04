@@ -144,20 +144,94 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             return 0;
         }
         case FASTGIT_CMD_HASH_OBJECT: {
+            // parse -t <type> -w --stdin
+            const char* type_name = "blob";
+            bool write = false;
+            bool use_stdin = false;
+            int file_start = 0;
+            for (int i = 0; i < cli->cmd_argc; i++) {
+                if (strcmp(cli->cmd_argv[i], "-w") == 0) write = true;
+                else if (strcmp(cli->cmd_argv[i], "--stdin") == 0) use_stdin = true;
+                else if (strcmp(cli->cmd_argv[i], "-t") == 0 && i+1 < cli->cmd_argc) { type_name = cli->cmd_argv[i+1]; i++; }
+                else if (cli->cmd_argv[i][0]=='-') { /* ignore unknown */ }
+                else { file_start = i; break; }
+            }
+            // collect files (or stdin)
+            int nfiles = use_stdin ? 1 : (cli->cmd_argc - file_start);
+            if (nfiles <= 0 && !use_stdin) {
+                fprintf(stderr, "usage: fastgit hash-object [-t <type>] [-w] [--stdin] [--] <file>...\n");
+                return 1;
+            }
+            fastgit_obj_type_t type = fastgit_obj_type_from_name(type_name);
+            fastgit_repository_t* repo = NULL;
+            fastgit_odb_t* odb = NULL;
+            if (write) {
+                if (fastgit_repository_open(".", &repo) != FASTGIT_OK) {
+                    // try init location fallback: use .git directly if not found but -w requires repo
+                    char gitdir[4096];
+                    if (fastgit_repository_init(".", false, &repo) != FASTGIT_OK) {
+                        fprintf(stderr, "fatal: not a fastgit repository (and -w requires one)\n");
+                        return 1;
+                    }
+                }
+                odb = fastgit_repository_odb(repo);
+            }
+            int ret = 0;
+            for (int fi = 0; fi < nfiles; fi++) {
+                const char* path = use_stdin ? "-" : cli->cmd_argv[file_start + fi];
+                void* data = NULL; size_t len = 0;
+                if (use_stdin) {
+                    size_t cap = 8192; data = malloc(cap); len = 0;
+                    size_t n; while ((n = fread((char*)data+len,1,cap-len,stdin))>0) { len+=n; if(len==cap){ cap*=2; data=realloc(data,cap); } }
+                    if (!data) { ret=1; break; }
+                } else {
+                    FILE* f = fopen(path, "rb");
+                    if (!f) { fprintf(stderr, "fatal: could not open '%s'\n", path); ret=1; continue; }
+                    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+                    if (sz<0) sz=0; len=(size_t)sz; data=malloc(len?len:1);
+                    if (len) fread(data,1,len,f); fclose(f);
+                }
+                fastgit_object_t* obj=NULL;
+                fastgit_error_t err = fastgit_object_parse(type, data, len, &obj);
+                free(data);
+                if (err!=FASTGIT_OK) { fprintf(stderr,"error: parse failed\n"); ret=1; continue; }
+                fastgit_oid_t oid;
+                err = fastgit_object_hash(obj, FASTGIT_HASH_SHA256, &oid);
+                if (err!=FASTGIT_OK) { fastgit_object_free(obj); ret=1; continue; }
+                if (write && odb) {
+                    fastgit_oid_t woid;
+                    fastgit_odb_write(odb, type, obj->data, obj->size, &woid);
+                    // woid should equal oid
+                }
+                char hex[129]; fastgit_oid_to_hex(&oid, hex, sizeof(hex));
+                printf("%s\n", hex);
+                fastgit_object_free(obj);
+            }
+            if (repo) fastgit_repository_free(repo);
+            return ret;
+        }
+        case FASTGIT_CMD_CAT_FILE: {
             if (cli->cmd_argc < 1) {
-                fprintf(stderr, "usage: fastgit hash-object <file>\n");
+                fprintf(stderr, "usage: fastgit cat-file [-p|-t|-s] <object>\n");
                 return 1;
             }
-            fastgit_hash_t hash;
-            fastgit_error_t err = fastgit_hash_file(FASTGIT_HASH_SHA256, cli->cmd_argv[0], &hash);
-            if (err != FASTGIT_OK) {
-                fprintf(stderr, "error: could not hash file: %s\n", fastgit_error_string(err));
-                return 1;
+            const char* opt = NULL; const char* objname = NULL;
+            for (int i=0;i<cli->cmd_argc;i++) {
+                if (cli->cmd_argv[i][0]=='-') opt=cli->cmd_argv[i];
+                else objname=cli->cmd_argv[i];
             }
-            char hex[129];
-            fastgit_hash_to_hex(&hash, hex, sizeof(hex));
-            printf("%s\n", hex);
-            return 0;
+            if (!objname) { fprintf(stderr,"fatal: need object\n"); return 1; }
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a fastgit repository\n"); return 1; }
+            fastgit_oid_t oid;
+            if (fastgit_oid_from_hex(objname,&oid)!=FASTGIT_OK) { fprintf(stderr,"fatal: invalid object name %s\n",objname); fastgit_repository_free(repo); return 1; }
+            fastgit_odb_object_t o;
+            fastgit_error_t err = fastgit_odb_read(fastgit_repository_odb(repo), &oid, &o);
+            if (err!=FASTGIT_OK) { fprintf(stderr,"fatal: object %s not found\n",objname); fastgit_repository_free(repo); return 1; }
+            if (opt && strcmp(opt,"-t")==0) printf("%s\n", fastgit_obj_type_name(o.type));
+            else if (opt && strcmp(opt,"-s")==0) printf("%zu\n", o.size);
+            else fwrite(o.data,1,o.size,stdout);
+            free(o.data); fastgit_repository_free(repo); return 0;
         }
         case FASTGIT_CMD_STATUS: {
             fastgit_repository_t* repo;

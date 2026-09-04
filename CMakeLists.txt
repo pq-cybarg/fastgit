@@ -50,15 +50,30 @@ if(PkgConfig_FOUND)
     endif()
 endif()
 
-# Global compile options matching previous build
-add_compile_options(-Wall -Wextra -Wpedantic -Werror -O3 -march=native)
+option(FASTGIT_ENABLE_WERROR "Treat warnings as errors" OFF)
+option(FASTGIT_NATIVE_OPT "Enable -march=native (non-portable)" OFF)
+
+# Global compile options - portable by default
+add_compile_options(-Wall -Wextra -Wpedantic -O3)
+if(FASTGIT_ENABLE_WERROR)
+    add_compile_options(-Werror)
+endif()
+if(FASTGIT_NATIVE_OPT)
+    add_compile_options(-march=native)
+endif()
 if(FASTGIT_ENABLE_LTO)
-    add_compile_options(-flto=thin)
-    add_link_options(-flto=thin)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT ipo_ok OUTPUT ipo_err)
+    if(ipo_ok)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    else()
+        add_compile_options(-flto=thin)
+        add_link_options(-flto=thin)
+    endif()
 endif()
 
-# ARM64 arch flag on Apple Silicon
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+# ARM64 arch flag only when explicitly requested and not cross-compiling
+if(FASTGIT_NATIVE_OPT AND APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
     add_compile_options(-arch arm64)
     add_link_options(-arch arm64)
 endif()

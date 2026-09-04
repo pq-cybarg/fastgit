@@ -40,3 +40,7 @@ add_test(NAME test_platform COMMAND test_platform)
 add_executable(test_cli test_cli.c)
 target_link_libraries(test_cli PRIVATE fastgit)
 add_test(NAME test_cli COMMAND test_cli)
+
+add_executable(test_kat test_kat.c)
+target_link_libraries(test_kat PRIVATE fastgit)
+add_test(NAME test_kat COMMAND test_kat)

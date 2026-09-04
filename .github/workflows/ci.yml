@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev libcurl4-openssl-dev libssh-dev
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl curl libssh || true
+      - name: Configure
+        run: cmake -S . -B build -DFASTGIT_ENABLE_WERROR=OFF -DFASTGIT_NATIVE_OPT=OFF
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Interop check
+        run: |
+          ./build/src/fastgit --help || true
+          rm -rf /tmp/fg-interop && mkdir -p /tmp/fg-interop
+          echo "hello fastgit" > /tmp/fg-interop/file.txt
+          ./build/src/fastgit init /tmp/fg-interop/repo
+          cp /tmp/fg-interop/file.txt /tmp/fg-interop/repo/file.txt
+          OID=$(./build/src/fastgit hash-object -w /tmp/fg-interop/repo/file.txt)
+          echo "OID $OID"
+          git --git-dir=/tmp/fg-interop/repo/.git cat-file -p "$OID" > /tmp/out.txt
+          diff /tmp/fg-interop/file.txt /tmp/out.txt && echo "interop OK"
+          ./build/tests/test_kat

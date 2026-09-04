@@ -65,11 +65,55 @@ fastgit_error_t fastgit_repository_init(const char* path, bool bare, fastgit_rep
     if (bare) snprintf(repo->gitdir, gl, "%s", path);
     else snprintf(repo->gitdir, gl, "%s/.git", path);
 
+    if (!bare) ensure_dir(repo->path);
     ensure_dir(repo->gitdir);
     char tmp[4096];
     snprintf(tmp, sizeof(tmp), "%s/objects", repo->gitdir); ensure_dir(tmp);
+    snprintf(tmp, sizeof(tmp), "%s/objects/pack", repo->gitdir); ensure_dir(tmp);
+    snprintf(tmp, sizeof(tmp), "%s/objects/info", repo->gitdir); ensure_dir(tmp);
     snprintf(tmp, sizeof(tmp), "%s/refs", repo->gitdir); ensure_dir(tmp);
     snprintf(tmp, sizeof(tmp), "%s/refs/heads", repo->gitdir); ensure_dir(tmp);
+    snprintf(tmp, sizeof(tmp), "%s/refs/tags", repo->gitdir); ensure_dir(tmp);
+    snprintf(tmp, sizeof(tmp), "%s/info", repo->gitdir); ensure_dir(tmp);
+    snprintf(tmp, sizeof(tmp), "%s/hooks", repo->gitdir); ensure_dir(tmp);
+    snprintf(tmp, sizeof(tmp), "%s/branches", repo->gitdir); ensure_dir(tmp);
+    // HEAD
+    {
+        char head_path[4096]; snprintf(head_path, sizeof(head_path), "%s/HEAD", repo->gitdir);
+        FILE* f = fopen(head_path, "w");
+        if (f) { fputs("ref: refs/heads/main\n", f); fclose(f); }
+    }
+    // config (SHA256 objectFormat for git interop)
+    {
+        char cfg_path[4096]; snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo->gitdir);
+        FILE* f = fopen(cfg_path, "w");
+        if (f) {
+            fputs("[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n", f);
+            fputs("[extensions]\n\tobjectFormat = sha256\n", f);
+            fclose(f);
+        }
+    }
+    // description
+    {
+        char desc_path[4096]; snprintf(desc_path, sizeof(desc_path), "%s/description", repo->gitdir);
+        FILE* f = fopen(desc_path, "w");
+        if (f) { fputs("Unnamed repository; edit this file 'description' to name the repository.\n", f); fclose(f); }
+    }
+    // info/exclude
+    {
+        char excl_path[4096]; snprintf(excl_path, sizeof(excl_path), "%s/info/exclude", repo->gitdir);
+        FILE* f = fopen(excl_path, "w");
+        if (f) {
+            fputs("# git ls-files --others --exclude-from=.git/info/exclude\n# Lines that start with '#' are comments.\n", f);
+            fclose(f);
+        }
+    }
+    // packed-refs (empty, git expects it optionally)
+    {
+        char pr_path[4096]; snprintf(pr_path, sizeof(pr_path), "%s/packed-refs", repo->gitdir);
+        FILE* f = fopen(pr_path, "w");
+        if (f) { fputs("# pack-refs with: peeled fully-peeled sorted\n", f); fclose(f); }
+    }
 
     char odb_path[4096];
     snprintf(odb_path, sizeof(odb_path), "%s/objects", repo->gitdir);
