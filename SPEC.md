@@ -45,8 +45,16 @@ CMake 3.20+ C23. Options `FASTGIT_NATIVE_OPT` (OFF default, enables `-march=nati
 - Targets: ODB write >1M/s read >5M/s, index add >2M/s, hash ~1.6GB/s SHA-256.
 - KATs: `tests/test_kat` NIST vectors for SHA-256/384/SHA3 (abc, empty, long). Must pass on CI.
 
-## 9. Non-goals (former SPEC bloat removed)
-GitHub capacity/autoscaling/MySQL/Rails incident postmortems are company concerns, not git format. Deferred: pack v2/v3 writer, smart HTTP, QUIC, io_uring wiring, distributed store.
+## 9. Roadmap to beat git (§10 honest status)
+| Feature | v0.2 status | Next |
+|---------|-------------|------|
+| hash/ODB loose/index/cli | shipped, git-interop verified | polish |
+| pack v2 read (SHA-256) | shipped for v0.3 — inflate+delta+idx, verified on git-generated packs | survive `git verify-pack` on macOS (Apple Git SHA256 experimental) |
+| pack write / MIDX / delta | stub | beat `git repack` throughput |
+| smart HTTP/SSH | stub | surpass `git fetch` / `git push` latency |
+| io_uring/QUIC/distributed store | stub | - |
+
+No feature is out of scope. The project aims to beat git on every front; v0.2 only defers what is not yet measured surpassing.
 
 ## 10. Verification
 ```
