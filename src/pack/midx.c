@@ -135,9 +135,9 @@ fastgit_error_t fastgit_midx_open(const char* midx_file, fastgit_midx_t** out) {
     }
     for (uint32_t i = 0; i < midx->object_count; i++) {
         midx->oids[i].algo = FASTGIT_HASH_SHA256;
-        midx->oids[i].len = 20;
-        memcpy(midx->oids[i].hash, ptr, 20);
-        ptr += 20;
+        midx->oids[i].len = 32;
+        memcpy(midx->oids[i].hash, ptr, 32);
+        ptr += 32;
     }
 
     midx->pack_indices = malloc(midx->object_count * sizeof(uint32_t));
@@ -190,20 +190,16 @@ void fastgit_midx_free(fastgit_midx_t* midx) {
 
 fastgit_error_t fastgit_midx_find(fastgit_midx_t* midx, const fastgit_oid_t* oid, fastgit_pack_t** pack_out, uint32_t* index_out) {
     if (!midx || !oid || !pack_out || !index_out) return FASTGIT_EINVAL;
-    if (oid->len != 20) return FASTGIT_ENOENT;
+    if (oid->len != 32) return FASTGIT_ENOENT;
 
     uint32_t first = oid->hash[0];
-    uint32_t lo = first ? 0 : 0;
-    uint32_t hi = midx->object_count;
-
     uint8_t* fanout = (uint8_t*)midx->mapped + 12 + midx->pack_count * 4;
-    for (uint32_t i = 0; i <= first; i++) {
-        lo = __builtin_bswap32(*(uint32_t*)(fanout + i * 4));
-    }
+    uint32_t lo = (first == 0) ? 0 : __builtin_bswap32(*(uint32_t*)(fanout + (first - 1) * 4));
+    uint32_t hi = __builtin_bswap32(*(uint32_t*)(fanout + first * 4));
 
     while (lo < hi) {
         uint32_t mid = (lo + hi) / 2;
-        int cmp = memcmp(midx->oids[mid].hash, oid->hash, 20);
+        int cmp = memcmp(midx->oids[mid].hash, oid->hash, 32);
         if (cmp < 0) lo = mid + 1;
         else if (cmp > 0) hi = mid;
         else {

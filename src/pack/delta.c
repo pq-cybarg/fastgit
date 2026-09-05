@@ -59,21 +59,20 @@ fastgit_error_t fastgit_delta_compress(const void* base, size_t base_len, const 
     size_t n1 = fastgit_encode_varint(0, hdr);
     size_t n2 = fastgit_encode_varint(target_len, hdr + n1);
     // encode as single literal insert: cmd &0x80 path in apply
-    size_t need = n1 + n2 + 1 + 2 + target_len;
-    if (target_len <= 0x7F) need = n1 + n2 + 1 + target_len;
+    size_t need = n1 + n2 + target_len + (target_len / 127 + 2);
     uint8_t* delta = (uint8_t*)malloc(need);
     if (!delta) return FASTGIT_ENOMEM;
     size_t pos=0;
     memcpy(delta+pos, hdr, n1); pos+=n1;
     memcpy(delta+pos, hdr+n1, n2); pos+=n2;
-    if (target_len <= 0x7F) {
-        delta[pos++] = 0x80 | (uint8_t)target_len;
-        memcpy(delta+pos, target, target_len); pos+=target_len;
-    } else {
-        delta[pos++] = 0x80;
-        delta[pos++] = target_len & 0xFF;
-        delta[pos++] = (target_len>>8) & 0xFF;
-        memcpy(delta+pos, target, target_len); pos+=target_len;
+    // git delta: split literal into 127-byte chunks with MSB 0
+    size_t off = 0;
+    while (off < target_len) {
+        size_t chunk = target_len - off;
+        if (chunk > 127) chunk = 127;
+        delta[pos++] = (uint8_t)chunk;
+        memcpy(delta+pos, (const uint8_t*)target + off, chunk); pos+=chunk;
+        off += chunk;
     }
     *out = delta;
     *out_len = pos;
@@ -100,31 +99,29 @@ fastgit_error_t fastgit_delta_apply(const void* base, size_t base_len, const voi
     while (d < dend && out_ptr < out_end) {
         uint8_t cmd = *d++;
         if (cmd & 0x80) {
+            // copy from base: bits 0x01..0x08 offset, 0x10..0x40 size
+            uint32_t off = 0;
+            uint32_t sz = 0;
+            if (cmd & 0x01) { if (d >= dend) return FASTGIT_ERROR; off |= (uint32_t)*d++; }
+            if (cmd & 0x02) { if (d >= dend) return FASTGIT_ERROR; off |= (uint32_t)*d++ << 8; }
+            if (cmd & 0x04) { if (d >= dend) return FASTGIT_ERROR; off |= (uint32_t)*d++ << 16; }
+            if (cmd & 0x08) { if (d >= dend) return FASTGIT_ERROR; off |= (uint32_t)*d++ << 24; }
+            if (cmd & 0x10) { if (d >= dend) return FASTGIT_ERROR; sz |= (uint32_t)*d++; }
+            if (cmd & 0x20) { if (d >= dend) return FASTGIT_ERROR; sz |= (uint32_t)*d++ << 8; }
+            if (cmd & 0x40) { if (d >= dend) return FASTGIT_ERROR; sz |= (uint32_t)*d++ << 16; }
+            if (sz == 0) sz = 0x10000;
+            if (!base || off + sz > base_len) return FASTGIT_ERROR;
+            if (out_ptr + sz > out_end) return FASTGIT_ERROR;
+            memcpy(out_ptr, (const uint8_t*)base + off, sz);
+            out_ptr += sz;
+        } else {
             size_t copy_len = cmd & 0x7F;
-            if (copy_len == 0) {
-                if (d + 1 > dend) return FASTGIT_ERROR;
-                copy_len = d[0] | (d[1] << 8);
-                d += 2;
-            }
+            if (copy_len == 0) return FASTGIT_ERROR;
             if (d + copy_len > dend) return FASTGIT_ERROR;
             if (out_ptr + copy_len > out_end) return FASTGIT_ERROR;
             memcpy(out_ptr, d, copy_len);
             out_ptr += copy_len;
             d += copy_len;
-        } else {
-            if (d + 4 > dend) return FASTGIT_ERROR;
-            uint32_t offset = d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24);
-            d += 4;
-            size_t copy_len = cmd & 0x0F;
-            if (copy_len == 0) {
-                if (d + 1 > dend) return FASTGIT_ERROR;
-                copy_len = d[0] | (d[1] << 8);
-                d += 2;
-            }
-            if (!base || offset + copy_len > base_len) return FASTGIT_ERROR;
-            if (out_ptr + copy_len > out_end) return FASTGIT_ERROR;
-            memcpy(out_ptr, (const uint8_t*)base + offset, copy_len);
-            out_ptr += copy_len;
         }
     }
     return FASTGIT_OK;
