@@ -152,7 +152,15 @@ fastgit_error_t fastgit_repository_open(const char* path, fastgit_repository_t**
     snprintf(repo->gitdir, gl, "%s/.git", path);
     struct stat st;
     if (stat(repo->gitdir, &st) != 0) {
-        // try bare
+        // try bare: must have objects dir to be a repo, otherwise not found
+        char bare_odb[4096];
+        snprintf(bare_odb, sizeof(bare_odb), "%s/objects", path);
+        if (stat(bare_odb, &st) != 0) {
+            free(repo->gitdir);
+            free(repo->path);
+            free(repo);
+            return FASTGIT_ENOENT;
+        }
         free(repo->gitdir);
         repo->gitdir = strdup(path);
         repo->bare = true;

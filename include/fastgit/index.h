@@ -38,7 +38,7 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     uint32_t size;
-    uint8_t sha1[20];
+    uint8_t oid[32];
     uint16_t flags;
 } fastgit_index_entry_disk_t;
 #pragma pack(pop)

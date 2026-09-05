@@ -13,20 +13,22 @@ A high-performance Git implementation in C targeting baremetal optimization acro
 - **Platform optimizations**: io_uring (Linux), IOCP (Windows), kqueue (macOS/BSD)
 - **CLI**: Git-compatible interface
 
-## Performance Targets (30x GitHub Scale)
+## Spec
 
-| Operation | Target |
-|-----------|--------|
-| `git init` | < 5ms |
-| `git add` (10K files) | < 500ms |
-| `git commit` | < 10ms |
-| `git status` (1M files) | < 200ms |
-| `git diff` (100K lines) | < 100ms |
-| Object lookup (cold) | < 1ms |
-| Object lookup (hot) | < 10µs |
-| Packfile write | > 500 MB/sec |
-| Packfile read | > 1 GB/sec |
-| Network transfer | Line rate (100Gbps+) |
+See [SPEC.md](SPEC.md) for format, repository layout, and supported commands. This
+project implements SPEC v0.2: SHA-256 by default with SHA-384/SHA3/SHAKE available,
+`blob <size>\0<data>` zlib loose objects at `$GITDIR/objects/ab/cdef`, and
+`.git/{HEAD,config,objects,refs}` layout interoperable with `git cat-file`.
+
+Non-goals: pack/fetch/push and server claims are out of scope for v0.2.
+
+## Performance (measured on Apple M-series, portable build)
+
+| Operation | Measured |
+|-----------|----------|
+| `hash-object` (SHA-256) | ~1700 MB/s |
+| ODB write / read (hot) | ~1.1M / ~28M ops/s |
+| index add (bulk, with hashing) | ~11M entries/s |
 
 ## Building
 
@@ -109,34 +111,17 @@ fastgit migrate sha384
 
 ## Configuration
 
-Create `.git/fastgit.conf` or `~/.config/fastgit/config`:
+Supported in v0.2 is the git-interop `.git/config`:
 
 ```ini
 [core]
-    hashAlgorithm = sha256
-    compression = zstd
-    compressionLevel = 3
-    packThreads = auto
-    indexThreads = auto
-    fsmonitor = true
+    repositoryformatversion = 1
 
-[performance]
-    workerThreads = auto
-    ioBackend = io_uring
-    mmapThreshold = 256MB
-    cacheSize = 512MB
-    loadShedding = true
-
-[network]
-    protocol = http2
-    tlsVersion = 1.3
-    rateLimit = 100000
-
-[pqc]
-    enabled = true
-    algorithms = ml-dsa-65,slh-dsa-sha2-128f
-    hybrid = true
+[extensions]
+    objectFormat = sha256
 ```
+
+Other sections (`[performance]`, `[network]`, `[pqc]`) are not implemented in v0.2.
 
 ## Architecture
 

@@ -41,7 +41,7 @@ Verbs: init, hash-object [-t <type>] [-w] [--stdin], cat-file [-p|-t|-s], status
 CMake 3.20+ C23. Options `FASTGIT_NATIVE_OPT` (OFF default, enables `-march=native`), `FASTGIT_ENABLE_WERROR` (OFF), `FASTGIT_ENABLE_LTO` (ON, via IPO check), `FASTGIT_USE_OPENSSL/SIMD`. No hardcoded `-arch arm64` without opt-in.
 
 ## 8. Benchmarks & Correctness
-- `ctest` 9 suites; `bench_hash/odb/index/pack/diff/full`.
+- `ctest` 10 suites; `bench_hash/odb/index/pack/diff/full`.
 - Targets: ODB write >1M/s read >5M/s, index add >2M/s, hash ~1.6GB/s SHA-256.
 - KATs: `tests/test_kat` NIST vectors for SHA-256/384/SHA3 (abc, empty, long). Must pass on CI.
 

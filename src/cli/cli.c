@@ -167,12 +167,8 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             fastgit_odb_t* odb = NULL;
             if (write) {
                 if (fastgit_repository_open(".", &repo) != FASTGIT_OK) {
-                    // try init location fallback: use .git directly if not found but -w requires repo
-                    char gitdir[4096];
-                    if (fastgit_repository_init(".", false, &repo) != FASTGIT_OK) {
-                        fprintf(stderr, "fatal: not a fastgit repository (and -w requires one)\n");
-                        return 1;
-                    }
+                    fprintf(stderr, "fatal: not a fastgit repository (and -w requires one)\n");
+                    return 1;
                 }
                 odb = fastgit_repository_odb(repo);
             }
@@ -232,6 +228,46 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             else if (opt && strcmp(opt,"-s")==0) printf("%zu\n", o.size);
             else fwrite(o.data,1,o.size,stdout);
             free(o.data); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_ADD: {
+            if (cli->cmd_argc < 1) {
+                fprintf(stderr, "usage: fastgit add <pathspec>...\n");
+                return 1;
+            }
+            fastgit_repository_t* repo;
+            fastgit_error_t err = fastgit_repository_open(".", &repo);
+            if (err != FASTGIT_OK) {
+                fprintf(stderr, "fatal: not a fastgit repository: %s\n", fastgit_error_string(err));
+                return 1;
+            }
+            fastgit_index_t* idx = fastgit_repository_index(repo);
+            // fast path: bulk add when multiple paths
+            if ((size_t)cli->cmd_argc > 1) {
+                const char** paths = (const char**)cli->cmd_argv;
+                err = fastgit_index_add_many(idx, paths, (size_t)cli->cmd_argc);
+                if (err != FASTGIT_OK) {
+                    fprintf(stderr, "error: add failed: %s\n", fastgit_error_string(err));
+                    fastgit_repository_free(repo);
+                    return 1;
+                }
+            } else {
+                for (int i = 0; i < cli->cmd_argc; i++) {
+                    err = fastgit_index_add(idx, cli->cmd_argv[i]);
+                    if (err != FASTGIT_OK) {
+                        fprintf(stderr, "error: could not add '%s': %s\n", cli->cmd_argv[i], fastgit_error_string(err));
+                        fastgit_repository_free(repo);
+                        return 1;
+                    }
+                }
+            }
+            err = fastgit_index_write(idx);
+            if (err != FASTGIT_OK) {
+                fprintf(stderr, "error: could not write index: %s\n", fastgit_error_string(err));
+                fastgit_repository_free(repo);
+                return 1;
+            }
+            fastgit_repository_free(repo);
+            return 0;
         }
         case FASTGIT_CMD_STATUS: {
             fastgit_repository_t* repo;

@@ -24,12 +24,12 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: Interop check
         run: |
-          ./build/src/fastgit --help || true
+          ./build/src/fastgit-cli --help || true
           rm -rf /tmp/fg-interop && mkdir -p /tmp/fg-interop
           echo "hello fastgit" > /tmp/fg-interop/file.txt
-          ./build/src/fastgit init /tmp/fg-interop/repo
+          ./build/src/fastgit-cli init /tmp/fg-interop/repo
           cp /tmp/fg-interop/file.txt /tmp/fg-interop/repo/file.txt
-          OID=$(./build/src/fastgit hash-object -w /tmp/fg-interop/repo/file.txt)
+          OID=$(cd /tmp/fg-interop/repo && $GITHUB_WORKSPACE/build/src/fastgit-cli hash-object -w file.txt)
           echo "OID $OID"
           git --git-dir=/tmp/fg-interop/repo/.git cat-file -p "$OID" > /tmp/out.txt
           diff /tmp/fg-interop/file.txt /tmp/out.txt && echo "interop OK"

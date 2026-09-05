@@ -51,8 +51,8 @@ static void index_entry_from_disk(const fastgit_index_entry_disk_t* disk, fastgi
     entry->flags_extended = 0;
     entry->stage = (entry->flags >> 12) & 0x3;
     entry->oid.algo = FASTGIT_HASH_SHA256;
-    entry->oid.len = 20;
-    memcpy(entry->oid.hash, disk->sha1, 20);
+    entry->oid.len = 32;
+    memcpy(entry->oid.hash, disk->oid, 32);
     entry->path = NULL;
 }
 
@@ -67,7 +67,7 @@ static void index_entry_to_disk(const fastgit_index_entry_t* entry, fastgit_inde
     disk->uid = __builtin_bswap32(entry->uid);
     disk->gid = __builtin_bswap32(entry->gid);
     disk->size = __builtin_bswap32(entry->size);
-    memcpy(disk->sha1, entry->oid.hash, 20);
+    memcpy(disk->oid, entry->oid.hash, 32);
     disk->flags = __builtin_bswap16(entry->flags);
 }
 
@@ -175,7 +175,7 @@ fastgit_error_t fastgit_index_read(fastgit_index_t* index, const char* path) {
     index->mtime = st.st_mtime;
 
     size_t file_size = st.st_size;
-    if (file_size < sizeof(fastgit_index_header_t) + 20) {
+    if (file_size < sizeof(fastgit_index_header_t) + 32) {
         close(fd);
         return FASTGIT_ERROR;
     }
@@ -249,21 +249,26 @@ fastgit_error_t fastgit_index_read(fastgit_index_t* index, const char* path) {
                 return FASTGIT_ENOMEM;
             }
             size_t path_len = entry->flags & 0x0FFF;
+            size_t entry_len;
             if (path_len == 0x0FFF) {
-                while (ptr < end && *ptr) ptr++;
-                ptr++;
+                size_t actual = 0;
+                while (ptr + actual < end && ptr[actual]) actual++;
+                entry_len = sizeof(fastgit_index_entry_disk_t) + actual + 1;
+                ptr += actual + 1;
             } else {
                 size_t actual = strlen(path_start);
+                entry_len = sizeof(fastgit_index_entry_disk_t) + actual + 1;
                 ptr += actual + 1;
             }
-            while (ptr < end && ((ptr - (uint8_t*)mapped) % 8 != 0)) ptr++;
+            size_t pad = (8 - (entry_len % 8)) % 8;
+            ptr += pad;
         }
     }
 
-    if (ptr + 20 <= end) {
+    if (ptr + 32 <= end) {
         index->checksum.algo = FASTGIT_HASH_SHA256;
-        index->checksum.len = 20;
-        memcpy(index->checksum.digest, ptr, 20);
+        index->checksum.len = 32;
+        memcpy(index->checksum.digest, ptr, 32);
     }
 
     index->sorted = true;
@@ -285,14 +290,13 @@ fastgit_error_t fastgit_index_write_to(fastgit_index_t* index, const char* path)
     }
     index->sorted = true;
 
-    size_t entries_size = index->count * sizeof(fastgit_index_entry_disk_t);
-    size_t path_size = 0;
+    size_t total_size = sizeof(fastgit_index_header_t);
     for (size_t i = 0; i < index->count; i++) {
-        path_size += strlen(index->entries[i].path) + 1;
-        while ((path_size + sizeof(fastgit_index_header_t) + entries_size + 20) % 8 != 0) path_size++;
+        size_t entry_len = sizeof(fastgit_index_entry_disk_t) + strlen(index->entries[i].path) + 1;
+        size_t pad = (8 - (entry_len % 8)) % 8;
+        total_size += entry_len + pad;
     }
-
-    size_t total_size = sizeof(fastgit_index_header_t) + entries_size + path_size + 20;
+    total_size += 32;
 
     void* buf = malloc(total_size);
     if (!buf) return FASTGIT_ENOMEM;
@@ -317,13 +321,13 @@ fastgit_error_t fastgit_index_write_to(fastgit_index_t* index, const char* path)
         memcpy(ptr, index->entries[i].path, path_len + 1);
         ptr += path_len + 1;
 
-        while ((ptr - (uint8_t*)buf) % 8 != 0) {
-            *ptr++ = 0;
-        }
+        size_t entry_len = sizeof(fastgit_index_entry_disk_t) + path_len + 1;
+        size_t pad = (8 - (entry_len % 8)) % 8;
+        for (size_t p = 0; p < pad; p++) *ptr++ = 0;
     }
 
     fastgit_hash(FASTGIT_HASH_SHA256, buf, ptr - (uint8_t*)buf, &index->checksum);
-    memcpy(ptr, index->checksum.digest, 20);
+    memcpy(ptr, index->checksum.digest, 32);
 
     int fd = index->vfs.open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
