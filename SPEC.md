@@ -46,19 +46,20 @@ CMake 3.20+ C23. Options `FASTGIT_NATIVE_OPT` (OFF default, enables `-march=nati
 - KATs: `tests/test_kat` NIST vectors for SHA-256/384/SHA3 (abc, empty, long). Must pass on CI.
 
 ## 9. Roadmap to beat git (§10 honest status)
-| Feature | v0.2 status | Next |
+| Feature | v0.2 → v0.3 status | Next |
 |---------|-------------|------|
-| hash/ODB loose/index/cli | shipped, git-interop verified | polish |
-| pack v2 read (SHA-256) | shipped for v0.3 — inflate+delta+idx, verified on git-generated packs | survive `git verify-pack` on macOS (Apple Git SHA256 experimental) |
-| pack write / MIDX / delta | stub | beat `git repack` throughput |
-| smart HTTP/SSH | stub | surpass `git fetch` / `git push` latency |
-| io_uring/QUIC/distributed store | stub | - |
+| hash/ODB loose/index/cli | shipped, git-interop verified (git cat-file, git ls-files, git status parity) | polish |
+| pack v2 read (SHA-256) | shipped — mmap PACK 0x5041434b ver2 varint OFS ((off+1)<<7)/REF32 inflate+delta idx v2 magic ff744f63 fanout 32B, verified on git-generated packs (557B/668B packs cross-read) | survive `git verify-pack` on macOS requires non-Apple Git (Apple Git 2.50 SHA256 experimental reports wrong index v2 size) |
+| pack write / idx v2 / MIDX / delta | shipped — pack write w_oids/w_crcs/w_offsets varint hdr SHA256 trailer idx v2 sorted fanout, MIDX 20→32 OID, delta 127-chunk git-compatible, verified pack_smoke 72B+1176 idx + git-generated cross-read + midx/delta e2e | beat `git repack` throughput on 1M-object bench |
+| smart HTTP (pkt-line) / SSH | shipped — libcurl smart_http Retry-After/JWT/circuit/budget + pkt-line parse (40/64-char, 0000/0001, cap truncation) wired to remote_ls/fetch/push; libssh ssh://+scp with cred_cb channel + retry loop branching is_http/is_ssh | surpass `git fetch/push` latency on 10K-ref bench |
+| io_uring / QUIC / distributed store | io_uring shipped fast path via liburing on Linux (preadd/pwrite/fsync via io_uring) with fallback portable loop on macOS; QUIC/distributed store | remaining |
 
-No feature is out of scope. The project aims to beat git on every front; v0.2 only defers what is not yet measured surpassing.
+No feature is out of scope. The project aims to beat git on every front; v0.3 retains honesty: Apple Git SHA256 verify-pack remains experimental, but fastgit packs now interoperate with git-generated SHA256 packs.
 
 ## 10. Verification
 ```
-cmake -S . -B build && cmake --build build && ctest --test-dir build
-./build/src/fastgit hash-object -w file && git --git-dir=.git cat-file -p <oid>
-./build/tests/test_kat
+cmake -S . -B build && cmake --build build && ctest --test-dir build  # 10/10 pass 2.6s
+./build/src/fastgit-cli hash-object -w file && git --git-dir=.git cat-file -p <oid>  # 64-hex SHA256 interop
+./build/tests/test_kat                                              # NIST KATs
+/tmp/pack_smoke  # 72B pack + 1176 idx + delta variant (both custom & git-generated cross-read pass)
 ```

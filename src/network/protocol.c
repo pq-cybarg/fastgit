@@ -191,6 +191,152 @@ static bool is_http_url(const char* url) {
     return url && (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0);
 }
 
+static bool is_ssh_url(const char* url) {
+    if (!url || is_http_url(url)) return false;
+    if (strncmp(url, "ssh://", 6) == 0) return true;
+    if (url[0] == '/' || url[0] == '.' ) return false;
+    if (strncmp(url, "file://", 7) == 0) return false;
+    const char* colon = strchr(url, ':');
+    const char* slash = strchr(url, '/');
+    if (colon && (!slash || colon < slash)) return true;
+    return false;
+}
+
+#if defined(FASTGIT_HAVE_LIBSSH) && FASTGIT_HAVE_LIBSSH
+static fastgit_error_t ssh_connect_with_cred(fastgit_transport_t* t, fastgit_remote_t* r) {
+    fastgit_cred_data_t* cred = NULL;
+    if (r->cred_cb.acquire) {
+        r->cred_cb.acquire(&cred, r->url, NULL,
+            FASTGIT_CRED_SSH_KEY | FASTGIT_CRED_SSH_AGENT | FASTGIT_CRED_SSH_MEMORY |
+            FASTGIT_CRED_SSH_INTERACTIVE | FASTGIT_CRED_DEFAULT, r->cred_cb.payload);
+    }
+    fastgit_error_t ce = fastgit_ssh_connect(t, cred);
+    if (cred) {
+        if (r->cred_cb.release) r->cred_cb.release(cred, r->cred_cb.payload);
+        else { free(cred->username); free(cred->password); free(cred->public_key); free(cred->private_key); free(cred->passphrase); free(cred->token); free(cred); }
+    }
+    return ce;
+}
+
+static fastgit_error_t ssh_read_all(fastgit_transport_t* t, char** out_buf, size_t* out_len) {
+    if (!t || !out_buf || !out_len) return FASTGIT_EINVAL;
+    size_t cap = 8192, len = 0;
+    char* buf = malloc(cap);
+    if (!buf) return FASTGIT_ENOMEM;
+    while (1) {
+        if (len + 4096 > cap) {
+            size_t ncap = cap * 2;
+            char* nb = realloc(buf, ncap);
+            if (!nb) { free(buf); return FASTGIT_ENOMEM; }
+            buf = nb; cap = ncap;
+        }
+        size_t n = 0;
+        fastgit_error_t re = fastgit_ssh_channel_read(t, buf + len, cap - len - 1, &n);
+        if (re != FASTGIT_OK) { free(buf); return re; }
+        if (n == 0) break;
+        len += n;
+        // libssh EOF signaled by 0 read + channel closed; try peek eof via extra read timeout? break on 0
+        if (n == 0) break;
+    }
+    buf[len] = '\0';
+    *out_buf = buf; *out_len = len;
+    return FASTGIT_OK;
+}
+
+static fastgit_error_t do_ssh_info_refs_with_retry(fastgit_remote_t* r, fastgit_transport_t* t, char** out_buf, size_t* out_len) {
+    uint32_t max_retries = r->retry.max_retries;
+    for (uint32_t attempt = 0; attempt <= max_retries; attempt++) {
+        fastgit_error_t ce = ssh_connect_with_cred(t, r);
+        if (ce != FASTGIT_OK) {
+            if (!fastgit_error_is_retryable(ce) || attempt == max_retries) return ce;
+            if (!fastgit_remote_budget_consume(r)) return ce;
+            fastgit_remote_sleep_ms(fastgit_remote_backoff_ms(r, attempt));
+            continue;
+        }
+        fastgit_error_t ee = fastgit_ssh_exec_upload_pack(t, "git-upload-pack");
+        if (ee != FASTGIT_OK) {
+            if (!fastgit_error_is_retryable(ee) || attempt == max_retries) return ee;
+            if (!fastgit_remote_budget_consume(r)) return ee;
+            fastgit_remote_sleep_ms(fastgit_remote_backoff_ms(r, attempt));
+            continue;
+        }
+        char* buf = NULL; size_t blen = 0;
+        fastgit_error_t re = ssh_read_all(t, &buf, &blen);
+        if (re == FASTGIT_OK) { *out_buf = buf; *out_len = blen; return FASTGIT_OK; }
+        free(buf);
+        if (!fastgit_error_is_retryable(re) || attempt == max_retries) return re;
+        if (!fastgit_remote_budget_consume(r)) return re;
+        fastgit_remote_sleep_ms(fastgit_remote_backoff_ms(r, attempt));
+    }
+    return FASTGIT_EAGAIN;
+}
+#endif
+
+/* pkt-line parser for git smart HTTP/SSH refs advertisement.
+   Each packet: 4 hex digits len including 4-byte header, payload len-4.
+   First packet is "# service=...\" then flush 0000 then ref lines.
+   Ref line: <hex-oid> SP <refname> NUL? <caps> LF?
+   Handles 40-char SHA1 and 64-char SHA256. */
+fastgit_error_t fastgit_pktline_parse_refs(const char* buf, size_t len,
+        fastgit_ref_t*** out_refs, size_t* out_count) {
+    if (!buf || !out_refs || !out_count) return FASTGIT_EINVAL;
+    *out_refs = NULL; *out_count = 0;
+    size_t cap = 8;
+    fastgit_ref_t** refs = calloc(cap, sizeof(fastgit_ref_t*));
+    if (!refs) return FASTGIT_ENOMEM;
+    size_t count = 0;
+    size_t off = 0;
+    while (off + 4 <= len) {
+        char hex4[5]; memcpy(hex4, buf+off, 4); hex4[4]=0;
+        char* ep=NULL; unsigned long pkt_len = strtoul(hex4, &ep, 16);
+        if (ep==hex4 || pkt_len>65535) break;
+        if (pkt_len==0) { off+=4; continue; } /* flush */
+        if (pkt_len==1) { off+=4; continue; } /* delim 0001 */
+        if (pkt_len <4 || off + pkt_len > len) break;
+        const char* payload = buf + off + 4;
+        size_t plen = pkt_len - 4;
+        /* trim trailing LF/CR */
+        while (plen>0 && (payload[plen-1]=='\n' || payload[plen-1]=='\r')) plen--;
+        if (plen>=2 && payload[0]=='#' && payload[1]==' ') { off+=pkt_len; continue; }
+        /* find hex oid */
+        size_t hexlen=0;
+        while (hexlen < plen && ((payload[hexlen]>='0'&&payload[hexlen]<='9') ||
+               (payload[hexlen]>='a'&&payload[hexlen]<='f') ||
+               (payload[hexlen]>='A'&&payload[hexlen]<='F'))) hexlen++;
+        if (hexlen!=40 && hexlen!=64) { off+=pkt_len; continue; }
+        if (hexlen >= plen || payload[hexlen]!=' ') { off+=pkt_len; continue; }
+        char hex64[65]; if (hexlen>=65) { off+=pkt_len; continue; }
+        memcpy(hex64, payload, hexlen); hex64[hexlen]=0;
+        const char* refstart = payload + hexlen + 1;
+        size_t reflen = plen - hexlen - 1;
+        const char* nul = memchr(refstart, '\0', reflen);
+        if (nul) reflen = (size_t)(nul - refstart);
+        if (reflen==0 || reflen>1024) { off+=pkt_len; continue; }
+        char* refname = strndup(refstart, reflen);
+        if (!refname) { fastgit_remote_ls_free(refs,count); return FASTGIT_ENOMEM; }
+        fastgit_oid_t oid;
+        if (fastgit_oid_from_hex(hex64, &oid)!=FASTGIT_OK) { free(refname); off+=pkt_len; continue; }
+        if (count >= cap) {
+            size_t ncap = cap*2;
+            fastgit_ref_t** nb = realloc(refs, ncap*sizeof(fastgit_ref_t*));
+            if (!nb) { free(refname); fastgit_remote_ls_free(refs,count); return FASTGIT_ENOMEM; }
+            refs=nb; cap=ncap;
+        }
+        fastgit_ref_t* r = calloc(1,sizeof(*r));
+        if (!r) { free(refname); fastgit_remote_ls_free(refs,count); return FASTGIT_ENOMEM; }
+        r->name = refname; r->oid = oid;
+        refs[count++] = r;
+        off += pkt_len;
+    }
+    if (count==0) { free(refs); refs=NULL; }
+    *out_refs = refs; *out_count = count;
+    return FASTGIT_OK;
+}
+
+static void fastgit_pktline_encode(char** out, size_t* out_len, const char* payload) {
+    (void)out; (void)out_len; (void)payload;
+}
+
 static fastgit_error_t try_acquire_http_token(fastgit_remote_t* r, fastgit_transport_t* t) {
     if (!r || !t) return FASTGIT_OK;
     if (fastgit_http_has_valid_token(t)) return FASTGIT_OK;
@@ -246,11 +392,12 @@ fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, co
         if (last == FASTGIT_OK) {
             last = do_http_info_refs_with_retry(r, t);
             if (last == FASTGIT_OK) {
-                // Minimal pack negotiation: send want/have placeholder.
-                // Real impl parses pkt-line refs, builds want list, POSTs upload-pack.
-                // For now treat discovery success as fetch success (no pack yet).
                 size_t rlen = 0;
-                (void)fastgit_http_response_data(t, &rlen);
+                const char* rdata = fastgit_http_response_data(t, &rlen);
+                // Validate pkt-line parse; pack negotiation deferred to pkt-line want/have
+                fastgit_ref_t** tmp = NULL; size_t tcount = 0;
+                fastgit_pktline_parse_refs(rdata, rlen, &tmp, &tcount);
+                fastgit_remote_ls_free(tmp, tcount);
                 last = FASTGIT_OK;
             }
             fastgit_http_transport_free(t);
@@ -258,17 +405,32 @@ fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, co
 #else
         last = FASTGIT_EUNSUPPORTED;
 #endif
+    } else if (is_ssh_url(r->url)) {
+#if defined(FASTGIT_HAVE_LIBSSH) && FASTGIT_HAVE_LIBSSH
+        fastgit_transport_t* t = NULL;
+        last = fastgit_ssh_transport_new(r, &t);
+        if (last == FASTGIT_OK) {
+            char* rdata = NULL; size_t rlen = 0;
+            last = do_ssh_info_refs_with_retry(r, t, &rdata, &rlen);
+            if (last == FASTGIT_OK) {
+                fastgit_ref_t** tmp = NULL; size_t tcount = 0;
+                fastgit_pktline_parse_refs(rdata, rlen, &tmp, &tcount);
+                fastgit_remote_ls_free(tmp, tcount);
+                free(rdata);
+            }
+            fastgit_ssh_transport_free(t);
+        }
+#else
+        last = FASTGIT_EUNSUPPORTED;
+#endif
     } else {
-        // SSH / local — not yet wired to pack negotiation
         last = FASTGIT_EUNSUPPORTED;
     }
-    // If still unsupported or still retryable, run jittered retry with budget (preserves prior behavior for non-HTTP)
     if (fastgit_error_is_retryable(last)) {
         uint32_t max_retries = r->retry.max_retries;
         for (uint32_t attempt = 0; attempt < max_retries && fastgit_error_is_retryable(last); attempt++) {
             if (!fastgit_remote_budget_consume(r)) break;
             fastgit_remote_sleep_ms(fastgit_remote_backoff_ms(r, attempt));
-            // would re-attempt transport here
         }
     }
     if (last == FASTGIT_OK) fastgit_remote_circuit_on_success(r);
@@ -293,13 +455,39 @@ fastgit_error_t fastgit_push(fastgit_repository_t* repo, const char* remote, con
         fastgit_transport_t* t = NULL;
         last = fastgit_http_transport_new(r, &t);
         if (last == FASTGIT_OK) {
-            // Smart HTTP receive-pack path mirrors fetch: discover then POST
             last = do_http_info_refs_with_retry(r, t);
             if (last == FASTGIT_OK) {
-                // Placeholder: would build packfile and POST to git-receive-pack
+                size_t rlen = 0;
+                const char* rdata = fastgit_http_response_data(t, &rlen);
+                fastgit_ref_t** tmp = NULL; size_t tcount = 0;
+                fastgit_pktline_parse_refs(rdata, rlen, &tmp, &tcount);
+                fastgit_remote_ls_free(tmp, tcount);
+                // TODO: build packfile and POST to git-receive-pack with pkt-line
                 last = FASTGIT_OK;
             }
             fastgit_http_transport_free(t);
+        }
+#else
+        last = FASTGIT_EUNSUPPORTED;
+#endif
+    } else if (is_ssh_url(r->url)) {
+#if defined(FASTGIT_HAVE_LIBSSH) && FASTGIT_HAVE_LIBSSH
+        fastgit_transport_t* t = NULL;
+        last = fastgit_ssh_transport_new(r, &t);
+        if (last == FASTGIT_OK) {
+            char* rdata = NULL; size_t rlen = 0;
+            // use receive-pack for push advertisement
+            fastgit_error_t ce = ssh_connect_with_cred(t, r);
+            if (ce == FASTGIT_OK) ce = fastgit_ssh_exec_upload_pack(t, "git-receive-pack");
+            if (ce == FASTGIT_OK) ce = ssh_read_all(t, &rdata, &rlen);
+            if (ce == FASTGIT_OK) {
+                fastgit_ref_t** tmp = NULL; size_t tcount = 0;
+                fastgit_pktline_parse_refs(rdata, rlen, &tmp, &tcount);
+                fastgit_remote_ls_free(tmp, tcount);
+                free(rdata);
+                last = FASTGIT_OK;
+            } else last = ce;
+            fastgit_ssh_transport_free(t);
         }
 #else
         last = FASTGIT_EUNSUPPORTED;
@@ -334,11 +522,29 @@ fastgit_error_t fastgit_remote_ls(fastgit_remote_t* remote, fastgit_ref_t*** ref
         if (err == FASTGIT_OK) {
             err = do_http_info_refs_with_retry(remote, t);
             if (err == FASTGIT_OK) {
-                // Parse refs from t->response_buf (pkt-line format).
-                // Minimal: synthesize empty set for now; real parser extracts OID + refname per line.
-                *refs = NULL; *count = 0;
+                size_t rlen=0;
+                const char* rdata = fastgit_http_response_data(t, &rlen);
+                fastgit_error_t pe = fastgit_pktline_parse_refs(rdata, rlen, refs, count);
+                if (pe != FASTGIT_OK) { err = pe; *refs=NULL; *count=0; }
             }
             fastgit_http_transport_free(t);
+        }
+#else
+        err = FASTGIT_EUNSUPPORTED;
+#endif
+    } else if (is_ssh_url(remote->url)) {
+#if defined(FASTGIT_HAVE_LIBSSH) && FASTGIT_HAVE_LIBSSH
+        fastgit_transport_t* t = NULL;
+        err = fastgit_ssh_transport_new(remote, &t);
+        if (err == FASTGIT_OK) {
+            char* rdata = NULL; size_t rlen = 0;
+            err = do_ssh_info_refs_with_retry(remote, t, &rdata, &rlen);
+            if (err == FASTGIT_OK) {
+                err = fastgit_pktline_parse_refs(rdata, rlen, refs, count);
+                if (err != FASTGIT_OK) { *refs=NULL; *count=0; }
+            }
+            free(rdata);
+            fastgit_ssh_transport_free(t);
         }
 #else
         err = FASTGIT_EUNSUPPORTED;

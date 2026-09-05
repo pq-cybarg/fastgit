@@ -20,6 +20,11 @@ typedef enum {
     FASTGIT_IO_BACKEND_SELECT = 5,
 } fastgit_io_backend_t;
 
+struct fastgit_io_context {
+    fastgit_io_backend_t backend;
+    int fd;
+    void* uring_ctx;
+};
 typedef struct fastgit_io_context fastgit_io_context_t;
 
 fastgit_error_t fastgit_io_context_new(fastgit_io_context_t** out);

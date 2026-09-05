@@ -13,11 +13,6 @@
 #include <sys/resource.h>
 #endif
 
-struct fastgit_io_context {
-    fastgit_io_backend_t backend;
-    int fd;
-};
-
 struct fastgit_thread_pool {
     fastgit_thread_pool_config_t config;
 #if defined(_WIN32)
@@ -80,28 +75,70 @@ fastgit_io_backend_t fastgit_io_context_backend(fastgit_io_context_t* ctx) {
 }
 
 fastgit_error_t fastgit_io_read(fastgit_io_context_t* ctx, fastgit_io_request_t* req) {
-    (void)ctx; (void)req;
+    (void)ctx;
+    if (!req || req->fd < 0 || !req->buf) return FASTGIT_EINVAL;
+#if defined(_WIN32)
+    (void)req;
     return FASTGIT_EUNSUPPORTED;
+#else
+    ssize_t n = pread(req->fd, req->buf, req->len, (off_t)req->offset);
+    if (n < 0) return FASTGIT_EIO;
+    if ((size_t)n != req->len && req->callback) req->callback((int)n, req->user_data);
+    else if (req->callback) req->callback((int)n, req->user_data);
+    return FASTGIT_OK;
+#endif
 }
 
 fastgit_error_t fastgit_io_write(fastgit_io_context_t* ctx, fastgit_io_request_t* req) {
-    (void)ctx; (void)req;
+    (void)ctx;
+    if (!req || req->fd < 0 || !req->buf) return FASTGIT_EINVAL;
+#if defined(_WIN32)
+    (void)req;
     return FASTGIT_EUNSUPPORTED;
+#else
+    ssize_t n = pwrite(req->fd, req->buf, req->len, (off_t)req->offset);
+    if (n < 0) return FASTGIT_EIO;
+    if (req->callback) req->callback((int)n, req->user_data);
+    return FASTGIT_OK;
+#endif
 }
 
 fastgit_error_t fastgit_io_fsync(fastgit_io_context_t* ctx, fastgit_io_request_t* req) {
-    (void)ctx; (void)req;
+    (void)ctx;
+    if (!req || req->fd < 0) return FASTGIT_EINVAL;
+#if defined(_WIN32)
+    (void)req;
     return FASTGIT_EUNSUPPORTED;
+#else
+    if (fsync(req->fd) != 0) return FASTGIT_EIO;
+    if (req->callback) req->callback(0, req->user_data);
+    return FASTGIT_OK;
+#endif
 }
 
 fastgit_error_t fastgit_io_submit(fastgit_io_context_t* ctx, fastgit_io_request_t** reqs, size_t count) {
-    (void)ctx; (void)reqs; (void)count;
-    return FASTGIT_EUNSUPPORTED;
+    if (!ctx || !reqs) return FASTGIT_EINVAL;
+    if (ctx->backend == FASTGIT_IO_BACKEND_IO_URING) {
+        extern fastgit_error_t fastgit_io_uring_submit(fastgit_io_context_t*, fastgit_io_request_t**, size_t);
+        fastgit_error_t rc = fastgit_io_uring_submit(ctx, reqs, count);
+        if (rc != FASTGIT_EUNSUPPORTED) return rc;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!reqs[i]) continue;
+        fastgit_io_read(ctx, reqs[i]);
+    }
+    return FASTGIT_OK;
 }
 
 fastgit_error_t fastgit_io_wait(fastgit_io_context_t* ctx, fastgit_io_request_t** reqs, size_t count, int* completed) {
-    (void)ctx; (void)reqs; (void)count; (void)completed;
-    return FASTGIT_EUNSUPPORTED;
+    if (!ctx) return FASTGIT_EINVAL;
+    if (ctx->backend == FASTGIT_IO_BACKEND_IO_URING) {
+        extern fastgit_error_t fastgit_io_uring_wait(fastgit_io_context_t*, fastgit_io_request_t**, size_t, int*);
+        fastgit_error_t rc = fastgit_io_uring_wait(ctx, reqs, count, completed);
+        if (rc != FASTGIT_EUNSUPPORTED) return rc;
+    }
+    if (completed) *completed = (int)count;
+    return FASTGIT_OK;
 }
 
 fastgit_error_t fastgit_memory_set_vfs(const fastgit_memory_vfs_t* vfs) {

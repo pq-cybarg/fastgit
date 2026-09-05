@@ -153,6 +153,9 @@ fastgit_error_t fastgit_remote_set_retry_policy(fastgit_remote_t* remote, const 
 fastgit_error_t fastgit_remote_set_circuit_breaker(fastgit_remote_t* remote, const fastgit_circuit_breaker_t* cb);
 fastgit_error_t fastgit_remote_set_load_shed(fastgit_remote_t* remote, const fastgit_load_shed_t* ls);
 
+// pkt-line parser (smart HTTP/SSH refs advertisement) — protocol.c
+fastgit_error_t fastgit_pktline_parse_refs(const char* buf, size_t len, fastgit_ref_t*** out_refs, size_t* out_count);
+
 // Transport lifecycle (HTTP/SSH) — implemented in smart_http.c / ssh.c
 fastgit_error_t fastgit_http_transport_new(fastgit_remote_t* remote, fastgit_transport_t** out);
 void fastgit_http_transport_free(fastgit_transport_t* transport);
