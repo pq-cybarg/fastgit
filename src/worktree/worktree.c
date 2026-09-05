@@ -134,6 +134,28 @@ const char* fastgit_worktree_gitdir(fastgit_worktree_t* wt) {
     return wt ? wt->gitdir : NULL;
 }
 
+static void mkdir_p(const char* path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    for (size_t i = 1; i < len; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+#if defined(_WIN32)
+            CreateDirectoryA(tmp, NULL);
+#else
+            mkdir(tmp, 0755);
+#endif
+            tmp[i] = '/';
+        }
+    }
+#if defined(_WIN32)
+    CreateDirectoryA(tmp, NULL);
+#else
+    mkdir(tmp, 0755);
+#endif
+}
+
 static fastgit_error_t checkout_entry(fastgit_worktree_t* wt, const fastgit_index_entry_t* entry, bool force __attribute__((unused))) {
     char full_path[4096];
     snprintf(full_path, sizeof(full_path), "%s/%s", wt->path, entry->path);
@@ -146,11 +168,7 @@ static fastgit_error_t checkout_entry(fastgit_worktree_t* wt, const fastgit_inde
     char* last_slash = strrchr(dir, '/');
     if (last_slash) {
         *last_slash = '\0';
-#if defined(_WIN32)
-        CreateDirectoryA(dir, NULL);
-#else
-        mkdir(dir, 0755);
-#endif
+        mkdir_p(dir);
     }
     free(dir);
 
@@ -188,8 +206,47 @@ fastgit_error_t fastgit_checkout_head(fastgit_worktree_t* wt, bool force) {
     return FASTGIT_OK;
 }
 
-fastgit_error_t fastgit_checkout_tree(fastgit_worktree_t* wt __attribute__((unused)), const fastgit_oid_t* tree_oid __attribute__((unused)), bool force __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+static fastgit_error_t checkout_tree_recursive(fastgit_worktree_t* wt, const fastgit_oid_t* tree_oid, const char* prefix, bool force) {
+    fastgit_odb_object_t obj;
+    fastgit_error_t err = fastgit_odb_read(wt->odb, tree_oid, &obj);
+    if (err != FASTGIT_OK) return err;
+    if (obj.type != FASTGIT_OBJ_TREE) { free(obj.data); return FASTGIT_EINVAL; }
+    const uint8_t* p = (const uint8_t*)obj.data;
+    const uint8_t* end = p + obj.size;
+    while (p < end) {
+        const char* sp = memchr(p, ' ', (size_t)(end - p));
+        if (!sp) { free(obj.data); return FASTGIT_EINVAL; }
+        uint32_t mode = (uint32_t)strtoul((const char*)p, NULL, 8);
+        const char* name = sp + 1;
+        const char* nul = memchr(name, '\0', (size_t)((const uint8_t*)end - (const uint8_t*)name));
+        if (!nul) { free(obj.data); return FASTGIT_EINVAL; }
+        size_t namelen = (size_t)(nul - name);
+        const uint8_t* oid_raw = (const uint8_t*)(nul + 1);
+        if (oid_raw + 32 > end) { free(obj.data); return FASTGIT_EINVAL; }
+        fastgit_oid_t eoid; memset(&eoid, 0, sizeof(eoid)); memcpy(eoid.hash, oid_raw, 32); eoid.len = 32; eoid.algo = FASTGIT_HASH_SHA256;
+        char full_path[4096];
+        if (prefix[0] == '\0') snprintf(full_path, sizeof(full_path), "%.*s", (int)namelen, name);
+        else snprintf(full_path, sizeof(full_path), "%s/%.*s", prefix, (int)namelen, name);
+        if (S_ISDIR(mode)) {
+            err = checkout_tree_recursive(wt, &eoid, full_path, force);
+            if (err != FASTGIT_OK && !force) { free(obj.data); return err; }
+        } else {
+            fastgit_index_entry_t entry = {0};
+            entry.path = full_path;
+            entry.oid = eoid;
+            entry.mode = mode;
+            entry.stage = FASTGIT_INDEX_STAGE_NORMAL;
+            err = checkout_entry(wt, &entry, force);
+            if (err != FASTGIT_OK && !force) { free(obj.data); return err; }
+        }
+        p = oid_raw + 32;
+    }
+    free(obj.data);
+    return FASTGIT_OK;
+}
+fastgit_error_t fastgit_checkout_tree(fastgit_worktree_t* wt, const fastgit_oid_t* tree_oid, bool force) {
+    if (!wt || !tree_oid) return FASTGIT_EINVAL;
+    return checkout_tree_recursive(wt, tree_oid, "", force);
 }
 
 fastgit_error_t fastgit_checkout_index(fastgit_worktree_t* wt, fastgit_index_t* index, bool force __attribute__((unused))) {
@@ -282,10 +339,19 @@ static fastgit_error_t status_compare_entry(fastgit_worktree_t* wt, const fastgi
         return FASTGIT_EIO;
     }
 
+    char hdr[32];
+    int hdr_len = snprintf(hdr, sizeof(hdr), "blob %zu", file_size);
+    hdr[hdr_len++] = '\0';
+    fastgit_hash_ctx_t* ctx = fastgit_hash_ctx_new(FASTGIT_HASH_SHA256);
+    if (!ctx) { free(data); return FASTGIT_ENOMEM; }
+    fastgit_hash_ctx_init(ctx);
+    fastgit_hash_ctx_update(ctx, hdr, (size_t)hdr_len);
+    if (file_size > 0) fastgit_hash_ctx_update(ctx, data, file_size);
     fastgit_hash_t h;
-    fastgit_error_t err = fastgit_hash(FASTGIT_HASH_SHA256, data, file_size, &h);
+    fastgit_hash_ctx_final(ctx, &h);
+    fastgit_hash_ctx_free(ctx);
     free(data);
-    if (err != FASTGIT_OK) return err;
+    fastgit_error_t err = FASTGIT_OK;
     fastgit_oid_t wt_oid;
     memset(&wt_oid, 0, sizeof(wt_oid));
     memcpy(wt_oid.hash, h.digest, h.len);
@@ -400,43 +466,66 @@ fastgit_error_t fastgit_status(fastgit_worktree_t* wt, fastgit_status_entry_t** 
     }
 untracked:;
 
-    DIR* dir = opendir(wt->path);
-    if (dir) {
-        struct dirent* de;
-        while ((de = readdir(dir)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-
-            char full_path[4096];
-            snprintf(full_path, sizeof(full_path), "%s/%s", wt->path, de->d_name);
-
-            struct stat st;
-            if (stat(full_path, &st) < 0) continue;
-            if (!S_ISREG(st.st_mode)) continue;
-
-            fastgit_index_entry_t* found = NULL;
-            bool in_index = (fastgit_index_find(wt->index, de->d_name, FASTGIT_INDEX_STAGE_NORMAL, &found) == FASTGIT_OK);
-
-            if (!in_index) {
-                if (status_count >= capacity) {
-                    capacity *= 2;
-                    fastgit_status_entry_t* new_entries = realloc(status_entries, capacity * sizeof(fastgit_status_entry_t));
-                    if (!new_entries) {
-                        for (size_t j = 0; j < status_count; j++) {
-                            free(status_entries[j].path);
+    // recursive untracked scan (skip .git, handle subdirs)
+    // simple stack-based DFS to avoid nftw dependency
+    {
+        size_t stack_cap = 32;
+        char** stack = malloc(stack_cap * sizeof(char*));
+        if (stack) {
+            size_t stack_len = 0;
+            stack[stack_len++] = strdup("");
+            while (stack_len > 0) {
+                char* rel = stack[--stack_len];
+                char dir_path[4096];
+                if (rel[0] == '\0') snprintf(dir_path, sizeof(dir_path), "%s", wt->path);
+                else snprintf(dir_path, sizeof(dir_path), "%s/%s", wt->path, rel);
+                DIR* d = opendir(dir_path);
+                if (!d) { free(rel); continue; }
+                struct dirent* de;
+                while ((de = readdir(d)) != NULL) {
+                    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+                    if (rel[0] == '\0' && strcmp(de->d_name, ".git") == 0) continue;
+                    char child_rel[4096];
+                    if (rel[0] == '\0') snprintf(child_rel, sizeof(child_rel), "%s", de->d_name);
+                    else snprintf(child_rel, sizeof(child_rel), "%s/%s", rel, de->d_name);
+                    char child_full[4096];
+                    snprintf(child_full, sizeof(child_full), "%s/%s", wt->path, child_rel);
+                    struct stat st;
+                    if (lstat(child_full, &st) < 0) continue;
+                    if (S_ISDIR(st.st_mode)) {
+                        if (stack_len >= stack_cap) {
+                            stack_cap *= 2;
+                            char** ns = realloc(stack, stack_cap * sizeof(char*));
+                            if (!ns) break;
+                            stack = ns;
                         }
-                        free(status_entries);
-                        return FASTGIT_ENOMEM;
+                        stack[stack_len++] = strdup(child_rel);
+                    } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+                        fastgit_index_entry_t* found = NULL;
+                        bool in_index = (fastgit_index_find(wt->index, child_rel, FASTGIT_INDEX_STAGE_NORMAL, &found) == FASTGIT_OK);
+                        if (!in_index) {
+                            if (status_count >= capacity) {
+                                capacity *= 2;
+                                fastgit_status_entry_t* ne = realloc(status_entries, capacity * sizeof(fastgit_status_entry_t));
+                                if (!ne) { for (size_t j=0;j<status_count;j++) free(status_entries[j].path); free(status_entries); for(size_t k=0;k<stack_len;k++) free(stack[k]); free(stack); free(rel); closedir(d); return FASTGIT_ENOMEM; }
+                                status_entries = ne;
+                            }
+                            fastgit_status_entry_t* se = &status_entries[status_count++];
+                            se->path = strdup(child_rel);
+                            se->index_status = FASTGIT_STATUS_CURRENT;
+                            se->worktree_status = FASTGIT_STATUS_WT_NEW;
+                            se->index_oid = (fastgit_oid_t){0};
+                            se->worktree_oid = (fastgit_oid_t){0};
+                            se->index_mode = 0;
+                            se->worktree_mode = st.st_mode & 0777;
+                        }
                     }
-                    status_entries = new_entries;
                 }
-
-                fastgit_status_entry_t* se = &status_entries[status_count++];
-                se->path = strdup(de->d_name);
-                se->index_status = FASTGIT_STATUS_CURRENT;
-                se->worktree_status = FASTGIT_STATUS_WT_NEW;
+                closedir(d);
+                free(rel);
             }
+            free(stack);
         }
-        closedir(dir);
     }
 
     *entries = status_entries;

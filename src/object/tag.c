@@ -59,13 +59,13 @@ void fastgit_tag_free(fastgit_tag_t* tag) {
     if (tag->tagger) fastgit_signature_free(tag->tagger);
 }
 
-static __attribute__((unused)) size_t tag_serialize_size(const struct fastgit_tag* t) {
+static size_t tag_serialize_size(const struct fastgit_tag* t) {
     size_t size = 0;
     char oid_hex[129];
     fastgit_oid_to_hex(&t->object, oid_hex, sizeof(oid_hex));
     size += 7 + strlen(oid_hex) + 1;
-    size += 12 + strlen(fastgit_obj_type_name(t->object_type)) + 1;
-    size += 5 + strlen(t->name) + 1;
+    size += 5 + strlen(fastgit_obj_type_name(t->object_type)) + 1;
+    size += 4 + strlen(t->name) + 1;
 
     if (t->tagger) {
         char *tagger_buf = NULL;
@@ -138,4 +138,11 @@ static __attribute__((unused)) void tag_serialize_write(const struct fastgit_tag
         memcpy(buf + *pos, "-----END PGP SIGNATURE-----", 27);
         *pos += 27;
     }
+}
+
+size_t fastgit_tag_content_size(const fastgit_object_t* obj) {
+    return tag_serialize_size((const struct fastgit_tag*)obj->data);
+}
+void fastgit_tag_content_write(const fastgit_object_t* obj, uint8_t* buf, size_t* pos) {
+    tag_serialize_write((const struct fastgit_tag*)obj->data, buf, pos);
 }

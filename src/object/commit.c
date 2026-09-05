@@ -75,7 +75,8 @@ void fastgit_commit_free(fastgit_commit_t* commit) {
     if (commit->committer) fastgit_signature_free(commit->committer);
 }
 
-static __attribute__((unused)) size_t commit_serialize_size(const struct fastgit_commit* c) {
+size_t fastgit_commit_content_size(const struct fastgit_commit* c); /* forward */
+static size_t commit_serialize_size(const struct fastgit_commit* c) {
     size_t size = 0;
     size += 5 + c->tree.len * 2 + 1;
 
@@ -166,6 +167,9 @@ static __attribute__((unused)) void commit_serialize_write(const struct fastgit_
         *pos += len;
     }
 }
+
+size_t fastgit_commit_content_size(const struct fastgit_commit* c) { return commit_serialize_size(c); }
+void fastgit_commit_content_write(const struct fastgit_commit* c, uint8_t* buf, size_t* pos) { commit_serialize_write(c, buf, pos); }
 
 fastgit_error_t fastgit_signature_new(const char* name, const char* email, int64_t when, int offset, fastgit_signature_t** out) {
     if (!name || !email || !out) return FASTGIT_EINVAL;

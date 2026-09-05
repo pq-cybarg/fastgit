@@ -53,17 +53,72 @@ fastgit_error_t fastgit_object_serialize(const fastgit_object_t* obj, uint8_t ha
 
     const char* type_name = (obj->type < 5) ? type_names[obj->type] : "unknown";
 
-    char header[64];
-    int header_len = snprintf(header, sizeof(header), "%s %zu", type_name, obj->size);
-    if (header_len < 0 || header_len >= (int)sizeof(header)) return FASTGIT_ERROR;
+    size_t content_len = 0;
+    uint8_t* content_buf = NULL;
+    bool need_free_content = false;
 
-    size_t total_len = header_len + 1 + obj->size;
+    // Dispatch to typed serializers if object holds structured data (size==0 indicates structured)
+    if (obj->type == FASTGIT_OBJ_COMMIT && obj->size == 0) {
+        const struct fastgit_commit* c = (const struct fastgit_commit*)obj->data;
+        if (c) {
+            // call commit helpers (now non-static via extern)
+            extern size_t fastgit_commit_content_size(const struct fastgit_commit* c);
+            extern void fastgit_commit_content_write(const struct fastgit_commit* c, uint8_t* buf, size_t* pos);
+            content_len = fastgit_commit_content_size(c);
+            content_buf = malloc(content_len);
+            if (!content_buf) return FASTGIT_ENOMEM;
+            size_t pos = 0;
+            fastgit_commit_content_write(c, content_buf, &pos);
+            need_free_content = true;
+        }
+    } else if (obj->type == FASTGIT_OBJ_TREE && obj->size == 0) {
+        const struct fastgit_tree* t = (const struct fastgit_tree*)obj->data;
+        if (t) {
+            extern size_t fastgit_tree_content_size(const struct fastgit_tree* t);
+            extern void fastgit_tree_content_write(const struct fastgit_tree* t, uint8_t* buf, size_t* pos);
+            content_len = fastgit_tree_content_size(t);
+            content_buf = malloc(content_len);
+            if (!content_buf) return FASTGIT_ENOMEM;
+            size_t pos = 0;
+            fastgit_tree_content_write(t, content_buf, &pos);
+            need_free_content = true;
+        }
+    } else if (obj->type == FASTGIT_OBJ_TAG && obj->size == 0) {
+        const struct fastgit_tag* tg = (const struct fastgit_tag*)obj->data;
+        if (tg) {
+            extern size_t fastgit_tag_content_size(const struct fastgit_tag* tg);
+            extern void fastgit_tag_content_write(const struct fastgit_tag* tg, uint8_t* buf, size_t* pos);
+            content_len = fastgit_tag_content_size(tg);
+            content_buf = malloc(content_len);
+            if (!content_buf) return FASTGIT_ENOMEM;
+            size_t pos = 0;
+            fastgit_tag_content_write(tg, content_buf, &pos);
+            need_free_content = true;
+        }
+    } else {
+        content_len = obj->size;
+        content_buf = (uint8_t*)obj->data;
+        need_free_content = false;
+    }
+
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_name, content_len);
+    if (header_len < 0 || header_len >= (int)sizeof(header)) {
+        if (need_free_content) free(content_buf);
+        return FASTGIT_ERROR;
+    }
+
+    size_t total_len = header_len + 1 + content_len;
     void* buf = malloc(total_len);
-    if (!buf) return FASTGIT_ENOMEM;
+    if (!buf) {
+        if (need_free_content) free(content_buf);
+        return FASTGIT_ENOMEM;
+    }
 
     memcpy(buf, header, header_len);
     ((uint8_t*)buf)[header_len] = '\0';
-    memcpy((uint8_t*)buf + header_len + 1, obj->data, obj->size);
+    memcpy((uint8_t*)buf + header_len + 1, content_buf, content_len);
+    if (need_free_content) free(content_buf);
 
     out->data = buf;
     out->len = total_len;

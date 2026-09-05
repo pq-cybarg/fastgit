@@ -371,11 +371,18 @@ fastgit_error_t fastgit_index_add(fastgit_index_t* index, const char* path) {
     index->vfs.close(fd);
 
     fastgit_hash_t hash;
-    fastgit_error_t err;
-    if (file_size == 0) {
-        err = fastgit_hash(FASTGIT_HASH_SHA256, "", 0, &hash);
-    } else {
-        err = fastgit_hash(FASTGIT_HASH_SHA256, data, file_size, &hash);
+    fastgit_error_t err = FASTGIT_OK;
+    {
+        char hdr[32];
+        int hdr_len = snprintf(hdr, sizeof(hdr), "blob %zu", file_size);
+        hdr[hdr_len++] = '\0';
+        fastgit_hash_ctx_t* hctx = fastgit_hash_ctx_new(FASTGIT_HASH_SHA256);
+        if (!hctx) { free(data); return FASTGIT_ENOMEM; }
+        fastgit_hash_ctx_init(hctx);
+        fastgit_hash_ctx_update(hctx, hdr, (size_t)hdr_len);
+        if (file_size > 0 && data) fastgit_hash_ctx_update(hctx, data, file_size);
+        err = fastgit_hash_ctx_final(hctx, &hash);
+        fastgit_hash_ctx_free(hctx);
     }
     if (err != FASTGIT_OK) {
         free(data);
@@ -445,23 +452,28 @@ static void bulk_hash_fn(void* arg) {
     if (fd < 0) { t->err = FASTGIT_ENOENT; return; }
     if (fstat(fd, &t->fst) != 0) { close(fd); t->err = FASTGIT_EIO; return; }
     t->file_size = (size_t)t->fst.st_size;
-    fastgit_error_t he = FASTGIT_OK;
-    if (t->file_size == 0) {
-        he = fastgit_hash(FASTGIT_HASH_SHA256, "", 0, &t->hash);
-    } else {
-        void* data = malloc(t->file_size);
+    void* data = NULL;
+    if (t->file_size > 0) {
+        data = malloc(t->file_size);
         if (!data) { close(fd); t->err = FASTGIT_ENOMEM; return; }
         ssize_t n = read(fd, data, t->file_size);
-        close(fd);
-        if (n != (ssize_t)t->file_size) { free(data); t->err = FASTGIT_EIO; return; }
-        he = fastgit_hash(FASTGIT_HASH_SHA256, data, t->file_size, &t->hash);
-        free(data);
-        if (he != FASTGIT_OK) { t->err = he; return; }
-        t->err = FASTGIT_OK;
-        return;
+        if (n != (ssize_t)t->file_size) { free(data); close(fd); t->err = FASTGIT_EIO; return; }
     }
     close(fd);
-    t->err = he;
+    {
+        char hdr[32];
+        int hdr_len = snprintf(hdr, sizeof(hdr), "blob %zu", t->file_size);
+        hdr[hdr_len++] = '\0';
+        fastgit_hash_ctx_t* hctx = fastgit_hash_ctx_new(FASTGIT_HASH_SHA256);
+        if (!hctx) { free(data); t->err = FASTGIT_ENOMEM; return; }
+        fastgit_hash_ctx_init(hctx);
+        fastgit_hash_ctx_update(hctx, hdr, (size_t)hdr_len);
+        if (t->file_size > 0) fastgit_hash_ctx_update(hctx, data, t->file_size);
+        fastgit_error_t he = fastgit_hash_ctx_final(hctx, &t->hash);
+        fastgit_hash_ctx_free(hctx);
+        free(data);
+        t->err = he;
+    }
 }
 
 fastgit_error_t fastgit_index_add_many(fastgit_index_t* index, const char** paths, size_t count) {
@@ -546,20 +558,35 @@ fastgit_error_t fastgit_index_add_many(fastgit_index_t* index, const char** path
     return FASTGIT_OK;
 }
 
-fastgit_error_t fastgit_index_add_from_buffer(fastgit_index_t* index, const char* path, uint32_t mode, const void* data __attribute__((unused)), size_t len __attribute__((unused))) {
+fastgit_error_t fastgit_index_add_from_buffer(fastgit_index_t* index, const char* path, uint32_t mode, const void* data, size_t len) {
     if (!index || !path) return FASTGIT_EINVAL;
 
     if (index->count >= index->capacity) {
-        index->capacity *= 2;
-        fastgit_index_entry_t* new_entries = realloc(index->entries, index->capacity * sizeof(fastgit_index_entry_t));
+        size_t new_cap = index->capacity ? index->capacity * 2 : 1024;
+        fastgit_index_entry_t* new_entries = realloc(index->entries, new_cap * sizeof(fastgit_index_entry_t));
         if (!new_entries) return FASTGIT_ENOMEM;
         index->entries = new_entries;
+        index->capacity = new_cap;
     }
 
+    fastgit_hash_t h;
+    {
+        char hdr[32];
+        int hdr_len = snprintf(hdr, sizeof(hdr), "blob %zu", len);
+        hdr[hdr_len++] = '\0';
+        fastgit_hash_ctx_t* hctx = fastgit_hash_ctx_new(FASTGIT_HASH_SHA256);
+        if (!hctx) return FASTGIT_ENOMEM;
+        fastgit_hash_ctx_init(hctx);
+        fastgit_hash_ctx_update(hctx, hdr, (size_t)hdr_len);
+        if (len > 0 && data) fastgit_hash_ctx_update(hctx, data, len);
+        fastgit_error_t he = fastgit_hash_ctx_final(hctx, &h);
+        fastgit_hash_ctx_free(hctx);
+        if (he != FASTGIT_OK) return he;
+    }
     fastgit_oid_t oid;
     oid.algo = FASTGIT_HASH_SHA256;
-    oid.len = 32;
-    memset(oid.hash, 0, 32);
+    oid.len = h.len;
+    memcpy(oid.hash, h.digest, h.len);
 
     fastgit_index_entry_t* entry = &index->entries[index->count++];
     entry->oid = oid;

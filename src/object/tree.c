@@ -109,16 +109,17 @@ const fastgit_tree_entry_t* fastgit_tree_entry_by_name(const fastgit_object_t* t
     return bsearch(&key, tree->entries, tree->count, sizeof(fastgit_tree_entry_t), tree_entry_cmp);
 }
 
-static __attribute__((unused)) size_t tree_serialize_size(const fastgit_tree_entry_t* entries, size_t count) {
+static size_t tree_serialize_size(const fastgit_tree_entry_t* entries, size_t count) {
     size_t size = 0;
     for (size_t i = 0; i < count; i++) {
-        size += strlen(entries[i].path) + 1;
-        size += 6 + entries[i].oid.len;
+        char mode_str[8];
+        int mode_len = snprintf(mode_str, sizeof(mode_str), "%o", entries[i].mode);
+        size += mode_len + 1 + strlen(entries[i].path) + 1 + entries[i].oid.len;
     }
     return size;
 }
 
-static __attribute__((unused)) void tree_serialize_write(const fastgit_tree_entry_t* entries, size_t count, uint8_t* buf, size_t* pos) {
+static void tree_serialize_write(const fastgit_tree_entry_t* entries, size_t count, uint8_t* buf, size_t* pos) {
     for (size_t i = 0; i < count; i++) {
         char mode_str[8];
         int mode_len = snprintf(mode_str, sizeof(mode_str), "%o", entries[i].mode);
@@ -129,9 +130,16 @@ static __attribute__((unused)) void tree_serialize_write(const fastgit_tree_entr
         memcpy(buf + *pos, entries[i].path, path_len);
         *pos += path_len;
         buf[(*pos)++] = '\0';
-        buf[(*pos)++] = (uint8_t)entries[i].oid.algo;
-        buf[(*pos)++] = (uint8_t)entries[i].oid.len;
         memcpy(buf + *pos, entries[i].oid.hash, entries[i].oid.len);
         *pos += entries[i].oid.len;
     }
+}
+
+size_t fastgit_tree_content_size(const struct fastgit_tree* t) {
+    if (!t) return 0;
+    return tree_serialize_size(t->entries, t->count);
+}
+void fastgit_tree_content_write(const struct fastgit_tree* t, uint8_t* buf, size_t* pos) {
+    if (!t || !buf || !pos) return;
+    tree_serialize_write(t->entries, t->count, buf, pos);
 }

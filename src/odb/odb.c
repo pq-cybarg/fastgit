@@ -1,6 +1,7 @@
 #include "fastgit/odb.h"
 #include "fastgit/object.h"
 #include "fastgit/hash.h"
+#include "fastgit/pack.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -215,6 +216,42 @@ fastgit_error_t fastgit_odb_read(fastgit_odb_t* odb, const fastgit_oid_t* oid, f
     for (size_t i = 0; i < odb->backend_count; i++) {
         fastgit_error_t err = fastgit_odb_read(odb->backends[i], oid, out);
         if (err == FASTGIT_OK) { odb->stats_cache_hits++; return FASTGIT_OK; }
+    }
+
+    // Pack/MIDX fallback (git-compatible 2-level loose miss -> consult packs)
+    {
+        char midx_path[1024];
+        snprintf(midx_path, sizeof(midx_path), "%s/pack/multi-pack-index", odb->path);
+        fastgit_midx_t* midx = NULL;
+        if (fastgit_midx_open(midx_path, &midx) == FASTGIT_OK) {
+            fastgit_pack_t* mp = NULL; uint32_t mi = 0;
+            if (fastgit_midx_find(midx, oid, &mp, &mi) == FASTGIT_OK && mp) {
+                fastgit_error_t pe = fastgit_pack_read_entry(mp, oid, out);
+                fastgit_midx_free(midx);
+                if (pe == FASTGIT_OK) return FASTGIT_OK;
+            } else {
+                fastgit_midx_free(midx);
+            }
+        }
+        char pack_dir[1024];
+        snprintf(pack_dir, sizeof(pack_dir), "%s/pack", odb->path);
+        DIR* pd = opendir(pack_dir);
+        if (pd) {
+            struct dirent* pe;
+            while ((pe = readdir(pd)) != NULL) {
+                size_t n = strlen(pe->d_name);
+                if (n < 5 || strcmp(pe->d_name + n - 4, ".idx") != 0) continue;
+                if (strncmp(pe->d_name, "multi-", 6) == 0) continue;
+                char idx_path[1024]; snprintf(idx_path, sizeof(idx_path), "%s/pack/%s", odb->path, pe->d_name);
+                char pack_path[1024]; snprintf(pack_path, sizeof(pack_path), "%s/pack/%.*s.pack", odb->path, (int)(n-4), pe->d_name);
+                fastgit_pack_t* pack = NULL;
+                if (fastgit_pack_open(pack_path, idx_path, &pack) != FASTGIT_OK) continue;
+                fastgit_error_t re = fastgit_pack_read_entry(pack, oid, out);
+                fastgit_pack_close(pack);
+                if (re == FASTGIT_OK) { closedir(pd); return FASTGIT_OK; }
+            }
+            closedir(pd);
+        }
     }
 
     char* path = odb_object_path(odb, oid);
@@ -451,12 +488,42 @@ fastgit_error_t fastgit_odb_exists(fastgit_odb_t* odb, const fastgit_oid_t* oid)
 #if defined(_WIN32)
     DWORD attrs = GetFileAttributesA(path);
     free(path);
-    return (attrs != INVALID_FILE_ATTRIBUTES) ? FASTGIT_OK : FASTGIT_ENOENT;
+    if (attrs != INVALID_FILE_ATTRIBUTES) return FASTGIT_OK;
 #else
     int ret = access(path, F_OK);
     free(path);
-    return (ret == 0) ? FASTGIT_OK : FASTGIT_ENOENT;
+    if (ret == 0) return FASTGIT_OK;
 #endif
+    // Fallback to packs/MIDX for existence check
+    {
+        char midx_path[1024];
+        snprintf(midx_path, sizeof(midx_path), "%s/pack/multi-pack-index", odb->path);
+        fastgit_midx_t* midx = NULL;
+        if (fastgit_midx_open(midx_path, &midx) == FASTGIT_OK) {
+            fastgit_pack_t* mp = NULL; uint32_t mi = 0;
+            if (fastgit_midx_find(midx, oid, &mp, &mi) == FASTGIT_OK) { fastgit_midx_free(midx); return FASTGIT_OK; }
+            fastgit_midx_free(midx);
+        }
+        char pack_dir[1024]; snprintf(pack_dir, sizeof(pack_dir), "%s/pack", odb->path);
+        DIR* pd = opendir(pack_dir);
+        if (pd) {
+            struct dirent* pe;
+            while ((pe = readdir(pd)) != NULL) {
+                size_t n = strlen(pe->d_name);
+                if (n < 5 || strcmp(pe->d_name + n - 4, ".idx") != 0) continue;
+                if (strncmp(pe->d_name, "multi-", 6) == 0) continue;
+                char idx_path[1024]; snprintf(idx_path, sizeof(idx_path), "%s/pack/%s", odb->path, pe->d_name);
+                fastgit_pack_index_t* idx = NULL;
+                if (fastgit_pack_index_load(idx_path, &idx) == FASTGIT_OK) {
+                    uint32_t out_idx = 0;
+                    if (fastgit_pack_index_find(idx, oid, &out_idx) == FASTGIT_OK) { fastgit_pack_index_free(idx); closedir(pd); return FASTGIT_OK; }
+                    fastgit_pack_index_free(idx);
+                }
+            }
+            closedir(pd);
+        }
+    }
+    return FASTGIT_ENOENT;
 }
 
 fastgit_error_t fastgit_odb_delete(fastgit_odb_t* odb, const fastgit_oid_t* oid) {
