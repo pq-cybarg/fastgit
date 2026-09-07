@@ -523,6 +523,82 @@ static void diff_append(char** buf, size_t* len, size_t* cap, const char* str, s
     (*buf)[*len] = '\0';
 }
 
+static fastgit_error_t diff_read_index_blob(fastgit_worktree_t* wt, const fastgit_oid_t* oid, char** out, size_t* out_len) {
+    if (!wt || !oid || !out || !out_len) return FASTGIT_EINVAL;
+    fastgit_odb_t* odb = wt->odb;
+    fastgit_odb_t* tmp = NULL;
+    if (!odb) {
+        char odb_path[4096];
+        snprintf(odb_path, sizeof(odb_path), "%s/objects", wt->gitdir);
+        if (fastgit_odb_open(odb_path, &tmp) != FASTGIT_OK) return FASTGIT_ENOENT;
+        odb = tmp;
+    }
+    fastgit_odb_object_t obj;
+    fastgit_error_t err = fastgit_odb_read(odb, oid, &obj);
+    if (tmp) fastgit_odb_free(tmp);
+    if (err != FASTGIT_OK) return err;
+    if (obj.type != FASTGIT_OBJ_BLOB) { free(obj.data); return FASTGIT_EINVAL; }
+    *out = obj.data;
+    *out_len = obj.size;
+    return FASTGIT_OK;
+}
+
+static fastgit_error_t diff_read_worktree_file(fastgit_worktree_t* wt, const char* rel, char** out, size_t* out_len) {
+    char full[4096];
+    snprintf(full, sizeof(full), "%s/%s", wt->path, rel);
+    int fd = open(full, O_RDONLY);
+    if (fd < 0) return FASTGIT_ENOENT;
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return FASTGIT_EIO; }
+    size_t sz = (size_t)st.st_size;
+    char* buf = malloc(sz ? sz : 1);
+    if (!buf) { close(fd); return FASTGIT_ENOMEM; }
+    ssize_t n = 0;
+    if (sz) n = read(fd, buf, sz);
+    close(fd);
+    if (sz && n != (ssize_t)sz) { free(buf); return FASTGIT_EIO; }
+    *out = buf;
+    *out_len = sz;
+    return FASTGIT_OK;
+}
+
+static void diff_emit_hunk(char** diff, size_t* diff_len, size_t* diff_cap, const char* old_data, size_t old_len, const char* new_data, size_t new_len) {
+    // simple unified diff: split by '\n', find first differing range
+    // count lines
+    size_t old_lines = 0, new_lines = 0;
+    for (size_t i = 0; i < old_len; i++) if (old_data[i] == '\n') old_lines++;
+    if (old_len && old_data[old_len-1] != '\n') old_lines++;
+    for (size_t i = 0; i < new_len; i++) if (new_data[i] == '\n') new_lines++;
+    if (new_len && new_data[new_len-1] != '\n') new_lines++;
+    if (old_lines == 0 && new_lines == 0) return;
+    char hunk_hdr[64];
+    int hl = snprintf(hunk_hdr, sizeof(hunk_hdr), "@@ -1,%zu +1,%zu @@\n", old_lines ? old_lines : 1, new_lines ? new_lines : 1);
+    if (hl > 0) diff_append(diff, diff_len, diff_cap, hunk_hdr, hl);
+    // naive: emit all old as '-' and new as '+'
+    // split and emit
+    size_t pos = 0;
+    while (pos < old_len) {
+        size_t e = pos;
+        while (e < old_len && old_data[e] != '\n') e++;
+        diff_append(diff, diff_len, diff_cap, "-", 1);
+        diff_append(diff, diff_len, diff_cap, old_data + pos, e - pos);
+        diff_append(diff, diff_len, diff_cap, "\n", 1);
+        pos = e + (e < old_len ? 1 : 0);
+    }
+    if (old_len == 0) {
+        // nothing
+    }
+    pos = 0;
+    while (pos < new_len) {
+        size_t e = pos;
+        while (e < new_len && new_data[e] != '\n') e++;
+        diff_append(diff, diff_len, diff_cap, "+", 1);
+        diff_append(diff, diff_len, diff_cap, new_data + pos, e - pos);
+        diff_append(diff, diff_len, diff_cap, "\n", 1);
+        pos = e + (e < new_len ? 1 : 0);
+    }
+}
+
 fastgit_error_t fastgit_diff_worktree(fastgit_worktree_t* wt, const char* path, char** out) {
     if (!wt || !out) return FASTGIT_EINVAL;
     if (path) {
@@ -538,10 +614,25 @@ fastgit_error_t fastgit_diff_worktree(fastgit_worktree_t* wt, const char* path, 
                 char header[512];
                 int hlen = snprintf(header, sizeof(header), "diff --git a/%s b/%s\n", se->path, se->path);
                 if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
-                hlen = snprintf(header, sizeof(header), "index %06o..%06o\n", se->index_mode & 0777, se->worktree_mode & 0777);
+                char hex_old[129] = {0}, hex_new[129] = {0};
+                fastgit_oid_to_hex(&se->index_oid, hex_old, sizeof(hex_old));
+                fastgit_oid_to_hex(&se->worktree_oid, hex_new, sizeof(hex_new));
+                // short 7 chars like git abbrev
+                char short_old[8] = {0}, short_new[8] = {0};
+                memcpy(short_old, hex_old, 7); memcpy(short_new, hex_new, 7);
+                hlen = snprintf(header, sizeof(header), "index %s..%s %06o\n", short_old, short_new, se->index_mode & 0777);
                 if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
                 hlen = snprintf(header, sizeof(header), "--- a/%s\n+++ b/%s\n", se->path, se->path);
                 if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
+                // hunk
+                char *old_data = NULL, *new_data = NULL; size_t old_len = 0, new_len = 0;
+                if (diff_read_index_blob(wt, &se->index_oid, &old_data, &old_len) == FASTGIT_OK) {
+                    if (diff_read_worktree_file(wt, se->path, &new_data, &new_len) == FASTGIT_OK) {
+                        diff_emit_hunk(&diff, &diff_len, &diff_cap, old_data, old_len, new_data, new_len);
+                        free(new_data);
+                    }
+                    free(old_data);
+                }
             } else {
                 diff = calloc(1, 1);
             }
@@ -569,12 +660,23 @@ fastgit_error_t fastgit_diff_worktree(fastgit_worktree_t* wt, const char* path, 
             char header[512];
             int hlen = snprintf(header, sizeof(header), "diff --git a/%s b/%s\n", se->path, se->path);
             if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
-
-            hlen = snprintf(header, sizeof(header), "index %06o..%06o\n", se->index_mode & 0777, se->worktree_mode & 0777);
+            char hex_old[129] = {0}, hex_new[129] = {0};
+            fastgit_oid_to_hex(&se->index_oid, hex_old, sizeof(hex_old));
+            fastgit_oid_to_hex(&se->worktree_oid, hex_new, sizeof(hex_new));
+            char short_old[8] = {0}, short_new[8] = {0};
+            memcpy(short_old, hex_old, 7); memcpy(short_new, hex_new, 7);
+            hlen = snprintf(header, sizeof(header), "index %s..%s %06o\n", short_old, short_new, se->index_mode & 0777);
             if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
-
             hlen = snprintf(header, sizeof(header), "--- a/%s\n+++ b/%s\n", se->path, se->path);
             if (hlen > 0) diff_append(&diff, &diff_len, &diff_cap, header, hlen);
+            char *old_data = NULL, *new_data = NULL; size_t old_len = 0, new_len = 0;
+            if (diff_read_index_blob(wt, &se->index_oid, &old_data, &old_len) == FASTGIT_OK) {
+                if (diff_read_worktree_file(wt, se->path, &new_data, &new_len) == FASTGIT_OK) {
+                    diff_emit_hunk(&diff, &diff_len, &diff_cap, old_data, old_len, new_data, new_len);
+                    free(new_data);
+                }
+                free(old_data);
+            }
         }
     }
 
