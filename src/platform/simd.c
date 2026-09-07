@@ -212,12 +212,28 @@ uint32_t fastgit_simd_crc32c(uint32_t crc, const void* buf, size_t len) {
 
 #endif
 
+#include "fastgit/hash.h"
+
 fastgit_error_t fastgit_simd_sha256(const void* data, size_t len, uint8_t* out) {
-    (void)data; (void)len; (void)out;
-    return FASTGIT_EUNSUPPORTED;
+    if (!data || !out) return FASTGIT_EINVAL;
+    fastgit_hash_t h;
+    fastgit_error_t err = fastgit_hash(FASTGIT_HASH_SHA256, data, len, &h);
+    if (err != FASTGIT_OK) return err;
+    memcpy(out, h.digest, 32);
+    return FASTGIT_OK;
 }
 
 fastgit_error_t fastgit_simd_sha512(const void* data, size_t len, uint8_t* out) {
-    (void)data; (void)len; (void)out;
-    return FASTGIT_EUNSUPPORTED;
+    if (!data || !out) return FASTGIT_EINVAL;
+    fastgit_hash_t h;
+    fastgit_error_t err = fastgit_hash(FASTGIT_HASH_SHA3_512, data, len, &h);
+    if (err != FASTGIT_OK) {
+        err = fastgit_hash(FASTGIT_HASH_SHA384, data, len, &h);
+        if (err != FASTGIT_OK) return err;
+        memcpy(out, h.digest, 48);
+        memset(out + 48, 0, 16);
+        return FASTGIT_OK;
+    }
+    memcpy(out, h.digest, 64);
+    return FASTGIT_OK;
 }
