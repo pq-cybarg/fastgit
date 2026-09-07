@@ -1,0 +1,26 @@
+# Maintainer: pq-cybarg <resistant@tuta.com>
+pkgname=fastgit
+pkgver=0.1.1
+pkgrel=1
+pkgdesc="Bare-metal C git reimplementation - hash-agile SHA256/SHA384/SHA3/SHAKE, 38 verbs, pack batch"
+arch=('x86_64' 'aarch64')
+url="https://github.com/pq-cybarg/fastgit"
+license=('MIT')
+depends=('openssl' 'zlib' 'curl' 'libssh')
+makedepends=('cmake' 'pkg-config')
+source=("https://github.com/pq-cybarg/fastgit/releases/download/v${pkgver}/fastgit-v${pkgver}-src.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cmake -S "fastgit-v${pkgver}" -B build -DCMAKE_BUILD_TYPE=Release -DFASTGIT_ENABLE_LTO=ON
+  cmake --build build -j$(nproc)
+}
+
+check() {
+  ctest --test-dir build --output-on-failure
+}
+
+package() {
+  cmake --install build --prefix "$pkgdir/usr"
+  install -Dm644 "fastgit-v${pkgver}/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,23 @@
+{
+    "version": "0.1.1",
+    "description": "Bare-metal C git reimplementation - hash-agile, 38 verbs, pack batch 1M",
+    "homepage": "https://github.com/pq-cybarg/fastgit",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/pq-cybarg/fastgit/releases/download/v0.1.1/fastgit-v0.1.1-windows-x64.zip",
+            "hash": "SKIP",
+            "bin": "fastgit.exe"
+        }
+    },
+    "checkver": {
+        "github": "https://github.com/pq-cybarg/fastgit"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/pq-cybarg/fastgit/releases/download/v$version/fastgit-v$version-windows-x64.zip"
+            }
+        }
+    }
+}
