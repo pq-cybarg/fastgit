@@ -5,6 +5,8 @@
 #include "fastgit/worktree.h"
 #include "fastgit/odb.h"
 #include "fastgit/hash.h"
+#include "fastgit/merge.h"
+#include "fastgit/rebase.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -616,6 +618,27 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             if(cli->cmd_argc==1){ char* v=NULL; if(fastgit_config_get(cli->cmd_argv[0],&v)==FASTGIT_OK){printf("%s\n",v); free(v);} else {fprintf(stderr,"not found\n"); return 1; } return 0; }
             if(cli->cmd_argc==2){ fastgit_config_set(cli->cmd_argv[0], cli->cmd_argv[1], "local"); return 0; }
             fprintf(stderr,"usage: fastgit config <key> [<value>]\n"); return 1;
+        }
+        case FASTGIT_CMD_MERGE: {
+            if (cli->cmd_argc < 1) { fprintf(stderr, "usage: fastgit merge <commit>\n"); return 1; }
+            fastgit_repository_t* repo = NULL;
+            if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+            fastgit_oid_t oid;
+            if (fastgit_rev_parse(repo, cli->cmd_argv[0], &oid) != FASTGIT_OK) { fprintf(stderr, "fatal: could not parse %s\n", cli->cmd_argv[0]); fastgit_repository_free(repo); return 1; }
+            fastgit_error_t err = fastgit_merge(repo, &oid, NULL);
+            if (err != FASTGIT_OK) { fprintf(stderr, "merge failed: %s\n", fastgit_error_string(err)); fastgit_repository_free(repo); return 1; }
+            fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_REBASE: {
+            if (cli->cmd_argc < 1) { fprintf(stderr, "usage: fastgit rebase <upstream>\n"); return 1; }
+            fastgit_repository_t* repo = NULL;
+            if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+            fastgit_oid_t oid;
+            if (fastgit_rev_parse(repo, cli->cmd_argv[0], &oid) != FASTGIT_OK) { fprintf(stderr, "fatal: could not parse %s\n", cli->cmd_argv[0]); fastgit_repository_free(repo); return 1; }
+            fastgit_rebase_options_t opts = {0};
+            fastgit_error_t err = fastgit_rebase(repo, &oid, &opts);
+            if (err != FASTGIT_OK) { fprintf(stderr, "rebase failed: %s\n", fastgit_error_string(err)); fastgit_repository_free(repo); return 1; }
+            fastgit_repository_free(repo); return 0;
         }
         case FASTGIT_CMD_VERSION: {
             printf("fastgit version %s\n", fastgit_version());
