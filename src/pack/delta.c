@@ -53,27 +53,62 @@ static __attribute__((unused)) size_t delta_window_find_match(const fastgit_delt
 }
 
 fastgit_error_t fastgit_delta_compress(const void* base, size_t base_len, const void* target, size_t target_len, void** out, size_t* out_len) {
-    (void)base; (void)base_len;
     if (!target || !out || !out_len) return FASTGIT_EINVAL;
     uint8_t hdr[20];
-    size_t n1 = fastgit_encode_varint(0, hdr);
+    size_t n1 = fastgit_encode_varint(base_len, hdr);
     size_t n2 = fastgit_encode_varint(target_len, hdr + n1);
-    // encode as single literal insert: cmd &0x80 path in apply
-    size_t need = n1 + n2 + target_len + (target_len / 127 + 2);
+    size_t need = n1 + n2 + target_len * 2 + 16;
     uint8_t* delta = (uint8_t*)malloc(need);
     if (!delta) return FASTGIT_ENOMEM;
-    size_t pos=0;
-    memcpy(delta+pos, hdr, n1); pos+=n1;
-    memcpy(delta+pos, hdr+n1, n2); pos+=n2;
-    // git delta: split literal into 127-byte chunks with MSB 0
-    size_t off = 0;
-    while (off < target_len) {
-        size_t chunk = target_len - off;
-        if (chunk > 127) chunk = 127;
-        delta[pos++] = (uint8_t)chunk;
-        memcpy(delta+pos, (const uint8_t*)target + off, chunk); pos+=chunk;
-        off += chunk;
+    size_t pos = 0;
+    memcpy(delta + pos, hdr, n1); pos += n1;
+    memcpy(delta + pos, hdr + n1, n2); pos += n2;
+    const uint8_t* t = (const uint8_t*)target;
+    const uint8_t* b = (const uint8_t*)base;
+    size_t tpos = 0;
+    uint8_t lit_buf[127];
+    size_t lit_len = 0;
+    while (tpos < target_len) {
+        size_t best_len = 0;
+        size_t best_off = 0;
+        if (b && base_len >= 4 && target_len - tpos >= 4) {
+            for (size_t boff = 0; boff + 4 <= base_len; boff++) {
+                if (b[boff] != t[tpos]) continue;
+                size_t ml = 0;
+                size_t max_ml = base_len - boff;
+                size_t remain = target_len - tpos;
+                if (max_ml > remain) max_ml = remain;
+                if (max_ml > 0x10000) max_ml = 0x10000;
+                while (ml < max_ml && b[boff + ml] == t[tpos + ml]) ml++;
+                if (ml > best_len) { best_len = ml; best_off = boff; if (ml >= remain) break; }
+            }
+        }
+        if (best_len >= 4) {
+            if (lit_len) { delta[pos++] = (uint8_t)lit_len; memcpy(delta + pos, lit_buf, lit_len); pos += lit_len; lit_len = 0; }
+            uint8_t cmd = 0x80;
+            if (best_off & 0xFF) cmd |= 0x01;
+            if (best_off & 0xFF00) cmd |= 0x02;
+            if (best_off & 0xFF0000) cmd |= 0x04;
+            if (best_off & 0xFF000000) cmd |= 0x08;
+            if (best_len & 0xFF) cmd |= 0x10;
+            if (best_len & 0xFF00) cmd |= 0x20;
+            if (best_len & 0xFF0000) cmd |= 0x40;
+            if (best_len == 0x10000) best_len = 0;
+            delta[pos++] = cmd;
+            if (cmd & 0x01) delta[pos++] = best_off & 0xFF;
+            if (cmd & 0x02) delta[pos++] = (best_off >> 8) & 0xFF;
+            if (cmd & 0x04) delta[pos++] = (best_off >> 16) & 0xFF;
+            if (cmd & 0x08) delta[pos++] = (best_off >> 24) & 0xFF;
+            if (cmd & 0x10) delta[pos++] = best_len & 0xFF;
+            if (cmd & 0x20) delta[pos++] = (best_len >> 8) & 0xFF;
+            if (cmd & 0x40) delta[pos++] = (best_len >> 16) & 0xFF;
+            if (best_len == 0) tpos += 0x10000; else tpos += best_len;
+        } else {
+            lit_buf[lit_len++] = t[tpos++];
+            if (lit_len == 127) { delta[pos++] = (uint8_t)lit_len; memcpy(delta + pos, lit_buf, lit_len); pos += lit_len; lit_len = 0; }
+        }
     }
+    if (lit_len) { delta[pos++] = (uint8_t)lit_len; memcpy(delta + pos, lit_buf, lit_len); pos += lit_len; }
     *out = delta;
     *out_len = pos;
     return FASTGIT_OK;
