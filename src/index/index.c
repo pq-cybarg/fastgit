@@ -1,6 +1,7 @@
 #include "fastgit/index.h"
 #include "fastgit/object.h"
 #include "fastgit/hash.h"
+#include "fastgit/odb.h"
 #include "fastgit/platform.h"
 #include <stdlib.h>
 #include <string.h>
@@ -704,13 +705,56 @@ const fastgit_index_entry_t* fastgit_index_entry_by_index(fastgit_index_t* index
     return &index->entries[n];
 }
 
-fastgit_error_t fastgit_index_conflict_add(fastgit_index_t* index __attribute__((unused)), const char* path __attribute__((unused)),
-    const fastgit_oid_t* ancestor __attribute__((unused)), const fastgit_oid_t* ours __attribute__((unused)), const fastgit_oid_t* theirs __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+fastgit_error_t fastgit_index_conflict_add(fastgit_index_t* index, const char* path,
+    const fastgit_oid_t* ancestor, const fastgit_oid_t* ours, const fastgit_oid_t* theirs) {
+    if (!index || !path) return FASTGIT_EINVAL;
+    if (!ancestor && !ours && !theirs) return FASTGIT_EINVAL;
+    // remove any existing entries for this path (all stages)
+    fastgit_index_conflict_remove(index, path);
+    // helper to add one stage
+    struct { const fastgit_oid_t* oid; uint32_t stage; } stages[3] = {
+        { ancestor, FASTGIT_INDEX_STAGE_BASE },
+        { ours,     FASTGIT_INDEX_STAGE_OURS },
+        { theirs,   FASTGIT_INDEX_STAGE_THEIRS },
+    };
+    for (int s = 0; s < 3; s++) {
+        if (!stages[s].oid) continue;
+        if (index->count >= index->capacity) {
+            size_t nc = index->capacity ? index->capacity * 2 : 16;
+            fastgit_index_entry_t* ne = realloc(index->entries, nc * sizeof(*ne));
+            if (!ne) return FASTGIT_ENOMEM;
+            index->entries = ne;
+            index->capacity = nc;
+        }
+        fastgit_index_entry_t* e = &index->entries[index->count++];
+        memset(e, 0, sizeof(*e));
+        e->oid = *stages[s].oid;
+        e->path = strdup(path);
+        if (!e->path) { index->count--; return FASTGIT_ENOMEM; }
+        e->mode = 0100644;
+        e->stage = stages[s].stage;
+        e->flags = (uint16_t)(strlen(path) & 0xFFF) | (stages[s].stage << 12);
+    }
+    index->dirty = true;
+    index->sorted = false;
+    return FASTGIT_OK;
 }
 
-fastgit_error_t fastgit_index_conflict_remove(fastgit_index_t* index __attribute__((unused)), const char* path __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+fastgit_error_t fastgit_index_conflict_remove(fastgit_index_t* index, const char* path) {
+    if (!index || !path) return FASTGIT_EINVAL;
+    size_t w = 0;
+    for (size_t r = 0; r < index->count; r++) {
+        if (strcmp(index->entries[r].path, path) == 0) {
+            free(index->entries[r].path);
+            continue;
+        }
+        if (w != r) index->entries[w] = index->entries[r];
+        w++;
+    }
+    bool removed = (w != index->count);
+    index->count = w;
+    if (removed) { index->dirty = true; }
+    return removed ? FASTGIT_OK : FASTGIT_ENOENT;
 }
 
 bool fastgit_index_has_conflicts(fastgit_index_t* index) {
@@ -721,12 +765,283 @@ bool fastgit_index_has_conflicts(fastgit_index_t* index) {
     return false;
 }
 
-fastgit_error_t fastgit_index_read_tree(fastgit_index_t* index __attribute__((unused)), const fastgit_oid_t* tree_oid __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+// helpers for write_tree / read_tree
+static fastgit_error_t odb_path_from_index(const fastgit_index_t* idx, char* out, size_t outsz) {
+    if (!idx || !idx->path || !out) return FASTGIT_EINVAL;
+    const char* p = idx->path;
+    size_t len = strlen(p);
+    // strip /index suffix
+    const char* suffix = "/index";
+    size_t sl = strlen(suffix);
+    if (len < sl || strcmp(p + len - sl, suffix) != 0) return FASTGIT_EINVAL;
+    size_t gitdir_len = len - sl;
+    if (gitdir_len + 9 >= outsz) return FASTGIT_EINVAL;
+    memcpy(out, p, gitdir_len);
+    out[gitdir_len] = '\0';
+    // gitdir is e.g. /repo/.git  -> objects at /repo/.git/objects
+    if (gitdir_len + 9 < outsz) {
+        // ensure no double slash
+        snprintf(out, outsz, "%.*s/objects", (int)gitdir_len, p);
+    }
+    return FASTGIT_OK;
 }
 
-fastgit_error_t fastgit_index_write_tree(fastgit_index_t* index __attribute__((unused)), fastgit_oid_t* out __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+static fastgit_error_t write_tree_recursive(fastgit_odb_t* odb, fastgit_index_entry_t* entries, size_t count,
+                                            const char* prefix, size_t prefix_len, fastgit_oid_t* out_oid);
+
+static fastgit_error_t write_tree_recursive(fastgit_odb_t* odb, fastgit_index_entry_t* entries, size_t count,
+                                            const char* prefix, size_t prefix_len, fastgit_oid_t* out_oid) {
+    // collect direct files and subdirs under prefix
+    // prefix is e.g. "a/b/" or "" for root
+    // entries are sorted by path
+    fastgit_object_t* tree_obj = NULL;
+    fastgit_error_t err = fastgit_tree_create(&tree_obj);
+    if (err != FASTGIT_OK) return err;
+
+    // group by next component
+    // we need to deduplicate subdirs
+    // first pass: handle files directly under prefix and collect unique subdir names
+    // use temporary list of subdir names
+    char** subdirs = NULL;
+    size_t subdir_count = 0, subdir_cap = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        const char* path = entries[i].path;
+        if (entries[i].stage != FASTGIT_INDEX_STAGE_NORMAL) continue;
+        if (prefix_len > 0) {
+            if (strncmp(path, prefix, prefix_len) != 0) continue;
+            path += prefix_len;
+        }
+        const char* slash = strchr(path, '/');
+        if (!slash) {
+            // direct file
+            fastgit_tree_entry_t te;
+            te.path = (char*)path;
+            te.oid = entries[i].oid;
+            te.mode = entries[i].mode;
+            // tree_add_entry sorts internally; pass copy
+            // avoid qsort per insert overhead for bulk - still ok for now
+            fastgit_error_t ae = fastgit_tree_add_entry(tree_obj, &te);
+            if (ae != FASTGIT_OK) { fastgit_object_free(tree_obj); free(subdirs); return ae; }
+        } else {
+            size_t dlen = (size_t)(slash - path);
+            bool known = false;
+            for (size_t k = 0; k < subdir_count; k++) {
+                if (strlen(subdirs[k]) == dlen && strncmp(subdirs[k], path, dlen) == 0) { known = true; break; }
+            }
+            if (!known) {
+                if (subdir_count >= subdir_cap) {
+                    size_t nc = subdir_cap ? subdir_cap * 2 : 8;
+                    char** ne = realloc(subdirs, nc * sizeof(char*));
+                    if (!ne) { fastgit_object_free(tree_obj); free(subdirs); return FASTGIT_ENOMEM; }
+                    subdirs = ne; subdir_cap = nc;
+                }
+                char* name = malloc(dlen + 1);
+                if (!name) { fastgit_object_free(tree_obj); for(size_t k=0;k<subdir_count;k++) free(subdirs[k]); free(subdirs); return FASTGIT_ENOMEM; }
+                memcpy(name, path, dlen); name[dlen] = '\0';
+                subdirs[subdir_count++] = name;
+            }
+        }
+    }
+
+    // for each subdir recurse
+    for (size_t s = 0; s < subdir_count; s++) {
+        char* name = subdirs[s];
+        // build new prefix
+        size_t new_prefix_len = prefix_len + strlen(name) + 1;
+        char* new_prefix = malloc(new_prefix_len + 1);
+        if (!new_prefix) { fastgit_object_free(tree_obj); for(size_t k=s;k<subdir_count;k++) free(subdirs[k]); free(subdirs); return FASTGIT_ENOMEM; }
+        if (prefix_len > 0) memcpy(new_prefix, prefix, prefix_len);
+        memcpy(new_prefix + prefix_len, name, strlen(name));
+        new_prefix[prefix_len + strlen(name)] = '/';
+        new_prefix[new_prefix_len] = '\0';
+
+        fastgit_oid_t sub_oid;
+        fastgit_error_t re = write_tree_recursive(odb, entries, count, new_prefix, new_prefix_len, &sub_oid);
+        free(new_prefix);
+        if (re != FASTGIT_OK) { fastgit_object_free(tree_obj); for(size_t k=s+1;k<subdir_count;k++) free(subdirs[k]); free(name); free(subdirs); return re; }
+
+        fastgit_tree_entry_t te;
+        te.path = name;
+        te.oid = sub_oid;
+        te.mode = 040000;
+        fastgit_error_t ae = fastgit_tree_add_entry(tree_obj, &te);
+        if (ae != FASTGIT_OK) { fastgit_object_free(tree_obj); for(size_t k=s+1;k<subdir_count;k++) free(subdirs[k]); free(name); free(subdirs); return ae; }
+        free(name);
+    }
+    free(subdirs);
+
+    // serialize tree content via public iterator (avoid private struct)
+    size_t content_len = 0;
+    size_t nentries = fastgit_tree_entry_count(tree_obj);
+    for (size_t ei = 0; ei < nentries; ei++) {
+        const fastgit_tree_entry_t* te = fastgit_tree_entry_by_index(tree_obj, ei);
+        char mode_str[16];
+        int ml = snprintf(mode_str, sizeof(mode_str), "%o", te->mode);
+        content_len += (size_t)ml + 1 + strlen(te->path) + 1 + te->oid.len;
+    }
+    uint8_t* content = malloc(content_len ? content_len : 1);
+    if (!content) { fastgit_object_free(tree_obj); return FASTGIT_ENOMEM; }
+    size_t pos = 0;
+    for (size_t ei = 0; ei < nentries; ei++) {
+        const fastgit_tree_entry_t* te = fastgit_tree_entry_by_index(tree_obj, ei);
+        char mode_str[16];
+        int ml = snprintf(mode_str, sizeof(mode_str), "%o", te->mode);
+        memcpy(content + pos, mode_str, (size_t)ml); pos += (size_t)ml;
+        content[pos++] = ' ';
+        size_t pl = strlen(te->path);
+        memcpy(content + pos, te->path, pl); pos += pl;
+        content[pos++] = '\0';
+        memcpy(content + pos, te->oid.hash, te->oid.len); pos += te->oid.len;
+    }
+    // write via odb
+    fastgit_oid_t oid;
+    fastgit_error_t we = fastgit_odb_write(odb, FASTGIT_OBJ_TREE, content, content_len, &oid);
+    free(content);
+    fastgit_object_free(tree_obj);
+    if (we != FASTGIT_OK) return we;
+    if (out_oid) *out_oid = oid;
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_index_read_tree(fastgit_index_t* index, const fastgit_oid_t* tree_oid) {
+    if (!index || !tree_oid) return FASTGIT_EINVAL;
+    char odb_path[4096];
+    fastgit_error_t err = odb_path_from_index(index, odb_path, sizeof(odb_path));
+    if (err != FASTGIT_OK) return err;
+    fastgit_odb_t* odb = NULL;
+    err = fastgit_odb_open(odb_path, &odb);
+    if (err != FASTGIT_OK) return err;
+
+    // clear existing
+    fastgit_index_clear(index);
+
+    // iterative stack for tree expansion
+    typedef struct { fastgit_oid_t oid; char* prefix; } stack_item_t;
+    stack_item_t* stack = malloc(sizeof(stack_item_t));
+    if (!stack) { fastgit_odb_free(odb); return FASTGIT_ENOMEM; }
+    stack[0].oid = *tree_oid;
+    stack[0].prefix = strdup("");
+    size_t stack_size = 1, stack_cap = 1;
+    if (!stack[0].prefix) { free(stack); fastgit_odb_free(odb); return FASTGIT_ENOMEM; }
+
+    while (stack_size > 0) {
+        stack_item_t cur = stack[--stack_size];
+        fastgit_odb_object_t obj;
+        err = fastgit_odb_read(odb, &cur.oid, &obj);
+        if (err != FASTGIT_OK) { free(cur.prefix); free(stack); fastgit_odb_free(odb); return err; }
+        if (obj.type != FASTGIT_OBJ_TREE) { free(obj.data); free(cur.prefix); free(stack); fastgit_odb_free(odb); return FASTGIT_EINVAL; }
+        uint8_t* p = (uint8_t*)obj.data;
+        uint8_t* end = p + obj.size;
+        while (p < end) {
+            char* space = memchr(p, ' ', (size_t)(end - p));
+            if (!space) break;
+            // mode
+            char mode_str[16]; size_t mlen = (size_t)(space - (char*)p);
+            if (mlen >= sizeof(mode_str)) { free(obj.data); free(cur.prefix); free(stack); fastgit_odb_free(odb); return FASTGIT_ERROR; }
+            memcpy(mode_str, p, mlen); mode_str[mlen] = '\0';
+            uint32_t mode = (uint32_t)strtoul(mode_str, NULL, 8);
+            p = (uint8_t*)space + 1;
+            char* nul = memchr(p, '\0', (size_t)(end - p));
+            if (!nul) break;
+            size_t namelen = (size_t)(nul - (char*)p);
+            char* name = malloc(namelen + 1);
+            if (!name) { free(obj.data); free(cur.prefix); free(stack); fastgit_odb_free(odb); return FASTGIT_ENOMEM; }
+            memcpy(name, p, namelen); name[namelen] = '\0';
+            p = (uint8_t*)nul + 1;
+            if ((size_t)(end - p) < 32) { free(name); break; }
+            fastgit_oid_t entry_oid;
+            entry_oid.algo = FASTGIT_HASH_SHA256;
+            entry_oid.len = 32;
+            memcpy(entry_oid.hash, p, 32);
+            p += 32;
+
+            // build full path
+            size_t full_len = strlen(cur.prefix) + namelen + 1;
+            char* full = malloc(full_len);
+            if (!full) { free(name); free(obj.data); free(cur.prefix); free(stack); fastgit_odb_free(odb); return FASTGIT_ENOMEM; }
+            strcpy(full, cur.prefix);
+            strcat(full, name);
+            free(name);
+
+            if (mode == 040000) {
+                // push sub-tree onto stack
+                if (stack_size >= stack_cap) {
+                    size_t nc = stack_cap * 2;
+                    stack_item_t* ne = realloc(stack, nc * sizeof(*ne));
+                    if (!ne) { free(full); free(obj.data); free(cur.prefix); free(stack); fastgit_odb_free(odb); return FASTGIT_ENOMEM; }
+                    stack = ne; stack_cap = nc;
+                }
+                size_t flen = strlen(full);
+                char* new_prefix = malloc(flen + 2);
+                if (!new_prefix) { free(full); free(obj.data); free(cur.prefix); free(stack); fastgit_odb_free(odb); return FASTGIT_ENOMEM; }
+                memcpy(new_prefix, full, flen);
+                new_prefix[flen] = '/';
+                new_prefix[flen+1] = '\0';
+                free(full);
+                stack[stack_size].oid = entry_oid;
+                stack[stack_size].prefix = new_prefix;
+                stack_size++;
+            } else {
+                // add index entry
+                if (index->count >= index->capacity) {
+                    size_t nc = index->capacity ? index->capacity * 2 : 64;
+                    fastgit_index_entry_t* ne = realloc(index->entries, nc * sizeof(*ne));
+                    if (!ne) { free(full); free(obj.data); free(cur.prefix); free(stack); fastgit_odb_free(odb); return FASTGIT_ENOMEM; }
+                    index->entries = ne;
+                    index->capacity = nc;
+                }
+                fastgit_index_entry_t* e = &index->entries[index->count++];
+                memset(e, 0, sizeof(*e));
+                e->oid = entry_oid;
+                e->path = full;
+                e->mode = mode;
+                e->stage = FASTGIT_INDEX_STAGE_NORMAL;
+                e->flags = (uint16_t)(strlen(full) & 0xFFF);
+                // stat fields left 0; will be refreshed on checkout/status
+            }
+        }
+        free(obj.data);
+        free(cur.prefix);
+    }
+    free(stack);
+    fastgit_odb_free(odb);
+    index->dirty = true;
+    index->sorted = false;
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_index_write_tree(fastgit_index_t* index, fastgit_oid_t* out) {
+    if (!index || !out) return FASTGIT_EINVAL;
+    if (fastgit_index_has_conflicts(index)) return FASTGIT_EINVAL;
+    if (index->count == 0) {
+        // empty tree: write empty tree object
+        char odb_path[4096];
+        fastgit_error_t err = odb_path_from_index(index, odb_path, sizeof(odb_path));
+        if (err != FASTGIT_OK) return err;
+        fastgit_odb_t* odb = NULL;
+        err = fastgit_odb_open(odb_path, &odb);
+        if (err != FASTGIT_OK) return err;
+        fastgit_oid_t oid;
+        err = fastgit_odb_write(odb, FASTGIT_OBJ_TREE, "", 0, &oid);
+        fastgit_odb_free(odb);
+        if (err == FASTGIT_OK) *out = oid;
+        return err;
+    }
+    // ensure sorted for deterministic write
+    if (!index->sorted && index->count > 1) {
+        qsort(index->entries, index->count, sizeof(fastgit_index_entry_t), index_entry_cmp);
+        index->sorted = true;
+    }
+    char odb_path[4096];
+    fastgit_error_t err = odb_path_from_index(index, odb_path, sizeof(odb_path));
+    if (err != FASTGIT_OK) return err;
+    fastgit_odb_t* odb = NULL;
+    err = fastgit_odb_open(odb_path, &odb);
+    if (err != FASTGIT_OK) return err;
+    err = write_tree_recursive(odb, index->entries, index->count, "", 0, out);
+    fastgit_odb_free(odb);
+    return err;
 }
 
 void fastgit_index_stats(fastgit_index_t* index, fastgit_index_stats_t* out) {

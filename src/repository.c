@@ -230,7 +230,238 @@ fastgit_error_t fastgit_blob_create_from_buffer(const void* data, size_t len, fa
     return fastgit_object_parse(FASTGIT_OBJ_BLOB, data, len, out);
 }
 
+#include <dirent.h>
+#include <unistd.h>
+#include "fastgit/hash.h"
 
+static fastgit_error_t ref_path_for_name(fastgit_repository_t* repo, const char* name, char* out, size_t out_len) {
+    if (!repo || !name || !out) return FASTGIT_EINVAL;
+    if (strncmp(name, "refs/", 5)==0) snprintf(out, out_len, "%s/%s", repo->gitdir, name);
+    else if (strcmp(name, "HEAD")==0) snprintf(out, out_len, "%s/HEAD", repo->gitdir);
+    else snprintf(out, out_len, "%s/refs/heads/%s", repo->gitdir, name);
+    return FASTGIT_OK;
+}
+static fastgit_error_t read_ref_file(const char* path, char* hex, size_t hex_len) {
+    FILE* f=fopen(path,"r"); if(!f) return FASTGIT_ENOENT;
+    if(!fgets(hex, (int)hex_len, f)){ fclose(f); return FASTGIT_EIO; }
+    fclose(f);
+    size_t l=strlen(hex); while(l>0 && (hex[l-1]=='\n'||hex[l-1]=='\r')) hex[--l]=0;
+    if (strncmp(hex,"ref: ",5)==0) return FASTGIT_EAGAIN; // symbolic
+    return FASTGIT_OK;
+}
+fastgit_error_t fastgit_reference_lookup(fastgit_repository_t* repo, const char* name, fastgit_oid_t* out) {
+    if(!repo||!name||!out) return FASTGIT_EINVAL;
+    char path[4096]; ref_path_for_name(repo,name,path,sizeof(path));
+    // resolve symbolic HEAD / refs
+    for(int depth=0; depth<8; depth++){
+        char hex[256]={0};
+        fastgit_error_t er = read_ref_file(path, hex, sizeof(hex));
+        if(er==FASTGIT_EAGAIN){
+            FILE* f=fopen(path,"r"); if(!f) return FASTGIT_ENOENT;
+            char line[512]={0}; fgets(line,sizeof(line),f); fclose(f);
+            char* p=line+5; while(*p==' ') p++; size_t ll=strlen(p); while(ll>0 && (p[ll-1]=='\n'||p[ll-1]=='\r')) p[--ll]=0;
+            // p is like refs/heads/main
+            snprintf(path,sizeof(path),"%s/%s", repo->gitdir, p);
+            continue;
+        }
+        if(er!=FASTGIT_OK){
+            // try packed-refs
+            char pr[4096]; snprintf(pr,sizeof(pr),"%s/packed-refs", repo->gitdir);
+            FILE* pf=fopen(pr,"r"); if(!pf) return er;
+            char line[512];
+            while(fgets(line,sizeof(line),pf)){
+                if(line[0]=='#'||line[0]=='^') continue;
+                char ohex[128], rname[256];
+                if(sscanf(line,"%127s %255s", ohex, rname)==2){
+                    const char* want=name;
+                    char full[512];
+                    if(strncmp(name,"refs/",5)!=0 && strcmp(name,"HEAD")!=0){ snprintf(full,sizeof(full),"refs/heads/%s", name); want=full; }
+                    if(strcmp(rname,want)==0 || strcmp(rname,name)==0){
+                        fclose(pf);
+                        return fastgit_oid_from_hex(ohex, out);
+                    }
+                }
+            }
+            fclose(pf);
+            return FASTGIT_ENOENT;
+        }
+        return fastgit_oid_from_hex(hex, out);
+    }
+    return FASTGIT_EIO;
+}
+static fastgit_error_t ensure_ref_dir(const char* ref_path){
+    char dir[4096]; strncpy(dir, ref_path, sizeof(dir)); dir[sizeof(dir)-1]=0;
+    char* slash=strrchr(dir,'/'); if(!slash) return FASTGIT_OK;
+    *slash=0;
+    char cur[4096]={0}; if(dir[0]=='/') strcpy(cur,"/"); 
+    char* tok=strtok(dir,"/"); char tmp[4096];
+    // reconstruct incremental mkdir
+    // simpler: use system mkdir -p via iterating
+    char build[4096]={0};
+    if(ref_path[0]=='/') strcpy(build,"/");
+    char copy[4096]; strncpy(copy, dir, sizeof(copy));
+    // actually dir already truncated; rebuild from original
+    // fallback: call mkdir -p via creating parent dirs
+    char d2[4096]; snprintf(d2,sizeof(d2),"%s", ref_path);
+    char* ls=strrchr(d2,'/'); if(ls) *ls=0;
+    char cmd[8192]; snprintf(cmd,sizeof(cmd),"mkdir -p \"%s\"", d2);
+    (void)system(cmd);
+    return FASTGIT_OK;
+}
+static fastgit_error_t append_reflog(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* old_oid, const fastgit_oid_t* new_oid, const char* msg){
+    char log_path[4096];
+    const char* rname=name;
+    char full[512];
+    if(strcmp(name,"HEAD")==0) rname="HEAD";
+    else if(strncmp(name,"refs/",5)!=0){ snprintf(full,sizeof(full),"refs/heads/%s", name); rname=full; }
+    else rname=name;
+    snprintf(log_path,sizeof(log_path),"%s/logs/%s", repo->gitdir, rname);
+    char dir[4096]; snprintf(dir,sizeof(dir),"%s/logs/%s", repo->gitdir, rname);
+    char* sl=strrchr(dir,'/'); if(sl){ *sl=0; char cmd[8192]; snprintf(cmd,sizeof(cmd),"mkdir -p \"%s\"", dir); (void)system(cmd); }
+    FILE* f=fopen(log_path,"a");
+    if(!f) return FASTGIT_OK; // reflog optional
+    char old_hex[129]={0}, new_hex[129]={0};
+    if(old_oid) fastgit_oid_to_hex(old_oid, old_hex, sizeof(old_hex));
+    else memset(old_hex,'0',64);
+    if(new_oid) fastgit_oid_to_hex(new_oid, new_hex, sizeof(new_hex));
+    else memset(new_hex,'0',64);
+    // signature
+    fastgit_signature_t* sig=NULL;
+    fastgit_signature_default(&sig);
+    int64_t when = sig?sig->when:0;
+    int off = sig?sig->offset:0;
+    const char* sname = sig&&sig->name?sig->name:"fastgit";
+    const char* semail = sig&&sig->email?sig->email:"fastgit@local";
+    char tz[16]; snprintf(tz,sizeof(tz),"%+05d", off);
+    if(sig) fastgit_signature_free(sig);
+    fprintf(f,"%s %s %s <%s> %lld %s\t%s\n", old_hex, new_hex, sname, semail, (long long)when, tz, msg?msg:"update");
+    fclose(f);
+    return FASTGIT_OK;
+}
+fastgit_error_t fastgit_reference_create(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* oid, bool force, const char* log_message){
+    if(!repo||!name||!oid) return FASTGIT_EINVAL;
+    // if updating HEAD symbolic, follow to target ref
+    const char* eff = name;
+    char resolved[512]="";
+    if(strcmp(name,"HEAD")==0){
+        char hp[4096]; snprintf(hp,sizeof(hp),"%s/HEAD", repo->gitdir);
+        FILE* hf=fopen(hp,"r");
+        if(hf){ char line[512]={0}; if(fgets(line,sizeof(line),hf)){ if(strncmp(line,"ref: ",5)==0){ char* p=line+5; while(*p==' ') p++; size_t ll=strlen(p); while(ll>0&&(p[ll-1]=='\n'||p[ll-1]=='\r')) p[--ll]=0; snprintf(resolved,sizeof(resolved),"%s",p); eff=resolved; } } fclose(hf); }
+    }
+    char path[4096]; ref_path_for_name(repo,eff,path,sizeof(path));
+    if(!force){
+        struct stat st; if(stat(path,&st)==0) return FASTGIT_EEXIST;
+    }
+    ensure_ref_dir(path);
+    fastgit_oid_t old; bool had_old = fastgit_reference_lookup(repo,name,&old)==FASTGIT_OK;
+    char hex[129]={0}; fastgit_oid_to_hex(oid, hex, sizeof(hex));
+    FILE* f=fopen(path,"w"); if(!f) return FASTGIT_EIO;
+    fprintf(f,"%s\n", hex); fclose(f);
+    append_reflog(repo,name, had_old?&old:NULL, oid, log_message?log_message:"create");
+    return FASTGIT_OK;
+}
+fastgit_error_t fastgit_reference_update(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* oid, const char* log_message){
+    return fastgit_reference_create(repo,name,oid,true,log_message?log_message:"update");
+}
+fastgit_error_t fastgit_reference_remove(fastgit_repository_t* repo, const char* name){
+    if(!repo||!name) return FASTGIT_EINVAL;
+    char path[4096]; ref_path_for_name(repo,name,path,sizeof(path));
+    fastgit_oid_t old; bool had=fastgit_reference_lookup(repo,name,&old)==FASTGIT_OK;
+    if(unlink(path)!=0) return FASTGIT_ENOENT;
+    append_reflog(repo,name, had?&old:NULL, NULL, "delete");
+    return FASTGIT_OK;
+}
+static void collect_refs_recursive(const char* base, const char* rel, char*** out, size_t* count, size_t* cap, const char* pattern){
+    char dir[4096]; snprintf(dir,sizeof(dir),"%s/%s", base, rel);
+    DIR* d=opendir(dir); if(!d) return;
+    struct dirent* e;
+    while((e=readdir(d))){
+        if(strcmp(e->d_name,".")==0||strcmp(e->d_name,"..")==0) continue;
+        char child_rel[4096]; if(rel[0]) snprintf(child_rel,sizeof(child_rel),"%s/%s", rel, e->d_name); else snprintf(child_rel,sizeof(child_rel),"%s", e->d_name);
+        char full[4096]; snprintf(full,sizeof(full),"%s/%s", base, child_rel);
+        struct stat st; if(stat(full,&st)!=0) continue;
+        if(S_ISDIR(st.st_mode)){
+            collect_refs_recursive(base, child_rel, out, count, cap, pattern);
+        } else {
+            if(pattern && strstr(child_rel, pattern)==NULL) continue;
+            if(*count>=*cap){ *cap=*cap?*cap*2:32; *out=realloc(*out,*cap*sizeof(char*)); }
+            (*out)[(*count)++]=strdup(child_rel);
+        }
+    }
+    closedir(d);
+}
+fastgit_error_t fastgit_reference_list(fastgit_repository_t* repo, const char* pattern, char*** out, size_t* count){
+    if(!repo||!out||!count) return FASTGIT_EINVAL;
+    *out=NULL; *count=0; size_t cap=0;
+    char base[4096]; snprintf(base,sizeof(base),"%s/refs", repo->gitdir);
+    collect_refs_recursive(base, "", out, count, &cap, pattern);
+    // also packed-refs
+    char pr[4096]; snprintf(pr,sizeof(pr),"%s/packed-refs", repo->gitdir);
+    FILE* f=fopen(pr,"r");
+    if(f){
+        char line[512];
+        while(fgets(line,sizeof(line),f)){
+            if(line[0]=='#'||line[0]=='^') continue;
+            char ohex[128], rname[256]; if(sscanf(line,"%127s %255s", ohex, rname)!=2) continue;
+            if(strncmp(rname,"refs/",5)!=0) continue;
+            const char* rel=rname+5;
+            if(pattern && strstr(rel,pattern)==NULL && strstr(rname,pattern)==NULL) continue;
+            // dedup: check already has file
+            bool dup=false; for(size_t i=0;i<*count;i++) if(strcmp((*out)[i], rel)==0||strcmp((*out)[i], rname)==0) {dup=true;break;}
+            if(dup) continue;
+            if(*count>=cap){ cap=cap?cap*2:32; *out=realloc(*out,cap*sizeof(char*)); }
+            (*out)[(*count)++]=strdup(rel);
+        }
+        fclose(f);
+    }
+    return FASTGIT_OK;
+}
+void fastgit_reference_list_free(char** list, size_t count){ if(!list) return; for(size_t i=0;i<count;i++) free(list[i]); free(list); }
+fastgit_error_t fastgit_rev_parse_single(fastgit_repository_t* repo, const char* spec, fastgit_oid_t* out){
+    if(!repo||!spec||!out) return FASTGIT_EINVAL;
+    if(strcmp(spec,"HEAD")==0) return fastgit_reference_lookup(repo,"HEAD",out);
+    // try direct hex
+    if(fastgit_oid_from_hex(spec,out)==FASTGIT_OK) return FASTGIT_OK;
+    // try refs/heads/<spec>
+    if(fastgit_reference_lookup(repo,spec,out)==FASTGIT_OK) return FASTGIT_OK;
+    char full[512]; snprintf(full,sizeof(full),"refs/heads/%s", spec);
+    if(fastgit_reference_lookup(repo,full,out)==FASTGIT_OK) return FASTGIT_OK;
+    snprintf(full,sizeof(full),"refs/tags/%s", spec);
+    if(fastgit_reference_lookup(repo,full,out)==FASTGIT_OK) return FASTGIT_OK;
+    return FASTGIT_ENOENT;
+}
+fastgit_error_t fastgit_rev_parse(fastgit_repository_t* repo, const char* spec, fastgit_oid_t* out){
+    // handle HEAD~N, HEAD^ etc minimal: support ~ and ^ suffix
+    if(!repo||!spec||!out) return FASTGIT_EINVAL;
+    char base[512]={0}; int tilde=-1;
+    const char* t=strchr(spec,'~'); const char* c=strchr(spec,'^');
+    const char* sep = t? t : c;
+    if(sep){
+        size_t blen=sep-spec; if(blen>=sizeof(base)) return FASTGIT_EINVAL;
+        memcpy(base,spec,blen); base[blen]=0;
+        if(*sep=='~'){
+            tilde = sep[1]? atoi(sep+1):1;
+        } else {
+            tilde = 0; // ^ means first parent for now
+            // ^N not fully handled
+        }
+    } else {
+        return fastgit_rev_parse_single(repo,spec,out);
+    }
+    fastgit_oid_t cur;
+    fastgit_error_t er=fastgit_rev_parse_single(repo, base[0]?base:"HEAD", &cur);
+    if(er!=FASTGIT_OK) return er;
+    for(int i=0;i<tilde;i++){
+        fastgit_object_t* obj=NULL;
+        if(fastgit_object_lookup(repo,&cur,&obj)!=FASTGIT_OK) return FASTGIT_ENOENT;
+        if(fastgit_object_type(obj)!=FASTGIT_OBJ_COMMIT){ fastgit_object_free(obj); return FASTGIT_EINVAL; }
+        const fastgit_commit_t* cmt = fastgit_commit_parse(obj);
+        if(!cmt || cmt->parent_count==0){ fastgit_object_free(obj); return FASTGIT_ENOENT; }
+        cur=cmt->parents[0];
+        fastgit_object_free(obj);
+    }
+    *out=cur; return FASTGIT_OK;
+}
 
 fastgit_error_t fastgit_clone(const char* url, const char* path, const char* ref) {
     (void)url;(void)path;(void)ref; return FASTGIT_EUNSUPPORTED;

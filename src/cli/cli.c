@@ -220,7 +220,7 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             fastgit_repository_t* repo=NULL;
             if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a fastgit repository\n"); return 1; }
             fastgit_oid_t oid;
-            if (fastgit_oid_from_hex(objname,&oid)!=FASTGIT_OK) { fprintf(stderr,"fatal: invalid object name %s\n",objname); fastgit_repository_free(repo); return 1; }
+            if (fastgit_rev_parse(repo,objname,&oid)!=FASTGIT_OK && fastgit_oid_from_hex(objname,&oid)!=FASTGIT_OK) { fprintf(stderr,"fatal: invalid object name %s\n",objname); fastgit_repository_free(repo); return 1; }
             fastgit_odb_object_t o;
             fastgit_error_t err = fastgit_odb_read(fastgit_repository_odb(repo), &oid, &o);
             if (err!=FASTGIT_OK) { fprintf(stderr,"fatal: object %s not found\n",objname); fastgit_repository_free(repo); return 1; }
@@ -241,6 +241,29 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
                 return 1;
             }
             fastgit_index_t* idx = fastgit_repository_index(repo);
+            fastgit_odb_t* odb = fastgit_repository_odb(repo);
+            // write blobs to ODB before updating index (mirrors git add)
+            for (int i = 0; i < cli->cmd_argc; i++) {
+                const char* path = cli->cmd_argv[i];
+                if (path[0] == '-') continue;
+                FILE* f = fopen(path, "rb");
+                if (!f) continue;
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz < 0) sz = 0;
+                size_t len = (size_t)sz;
+                void* data = malloc(len ? len : 1);
+                if (!data) { fclose(f); continue; }
+                if (len) {
+                    size_t n = fread(data, 1, len, f);
+                    (void)n;
+                }
+                fclose(f);
+                fastgit_oid_t woid;
+                fastgit_odb_write(odb, FASTGIT_OBJ_BLOB, data, len, &woid);
+                free(data);
+            }
             // fast path: bulk add when multiple paths
             if ((size_t)cli->cmd_argc > 1) {
                 const char** paths = (const char**)cli->cmd_argv;
@@ -286,6 +309,7 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
                 return 1;
             }
             for (size_t i = 0; i < count; i++) {
+                if (entries[i].worktree_status==0 && entries[i].index_status==0) continue;
                 const char* status_str = "";
                 switch (entries[i].worktree_status) {
                     case FASTGIT_STATUS_WT_NEW: status_str = "??"; break;
@@ -320,6 +344,278 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             printf("  CPU time:        %.2f ms\n", stats.cpu_time_ms);
             printf("  Wall time:       %.2f ms\n", stats.wall_time_ms);
             return 0;
+        }
+        case FASTGIT_CMD_COMMIT: {
+            const char* msg = NULL;
+            const char* msg_file = NULL;
+            bool amend = false;
+            for (int i=0;i<cli->cmd_argc;i++) {
+                if (strcmp(cli->cmd_argv[i],"-m")==0 && i+1<cli->cmd_argc) msg=cli->cmd_argv[++i];
+                else if (strcmp(cli->cmd_argv[i],"--amend")==0) amend=true;
+                else if (strncmp(cli->cmd_argv[i],"-m",2)==0) msg=cli->cmd_argv[i]+2;
+            }
+            if (!msg) msg = "commit via fastgit";
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a git repository\n"); return 1; }
+            fastgit_index_t* idx = fastgit_repository_index(repo);
+            fastgit_oid_t tree_oid;
+            if (fastgit_index_write_tree(idx, &tree_oid)!=FASTGIT_OK) { fprintf(stderr,"fatal: write-tree failed\n"); fastgit_repository_free(repo); return 1; }
+            fastgit_oid_t parent_oid; bool has_parent = (fastgit_reference_lookup(repo,"HEAD",&parent_oid)==FASTGIT_OK || fastgit_rev_parse(repo,"HEAD",&parent_oid)==FASTGIT_OK);
+            fastgit_signature_t *author=NULL,*committer=NULL;
+            fastgit_signature_default(&author); fastgit_signature_default(&committer);
+            fastgit_commit_t cmt = {0};
+            cmt.tree = tree_oid;
+            if (has_parent) { cmt.parent_count=1; cmt.parents=&parent_oid; }
+            cmt.author=author; cmt.committer=committer; cmt.message=(char*)msg;
+            fastgit_object_t* cobj=NULL;
+            if (fastgit_commit_create(&cmt,&cobj)!=FASTGIT_OK) { fprintf(stderr,"fatal: commit create failed\n"); fastgit_signature_free(author); fastgit_signature_free(committer); fastgit_repository_free(repo); return 1; }
+            fastgit_buf_t buf; fastgit_object_serialize(cobj, FASTGIT_HASH_SHA256, &buf);
+            fastgit_oid_t oid; fastgit_hash(FASTGIT_HASH_SHA256, buf.data, buf.len, (fastgit_hash_t*)&oid); oid.algo=FASTGIT_HASH_SHA256; oid.len=32;
+            // write via ODB – odb_write expects raw content without header, so strip header
+            fastgit_odb_t* odb=fastgit_repository_odb(repo);
+            fastgit_oid_t woid;
+            {
+                size_t hdr = 0; while (hdr < buf.len && ((uint8_t*)buf.data)[hdr] != '\0') hdr++;
+                const void* content = hdr < buf.len ? (uint8_t*)buf.data + hdr + 1 : buf.data;
+                size_t clen = hdr < buf.len ? buf.len - hdr - 1 : buf.len;
+                fastgit_odb_write(odb, FASTGIT_OBJ_COMMIT, content, clen, &woid);
+            }
+            fastgit_reference_update(repo, "HEAD", &woid, msg);
+            char hex[129]; fastgit_oid_to_hex(&woid,hex,sizeof(hex));
+            printf("[%s %s] %s\n", "main", hex, msg);
+            free(buf.data); fastgit_object_free(cobj);
+            // author/committer ownership transferred to cobj via fastgit_commit_create -> commit_data_free
+            fastgit_repository_free(repo); (void)amend; (void)msg_file;
+            return 0;
+        }
+        case FASTGIT_CMD_LOG: {
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a git repository\n"); return 1; }
+            fastgit_oid_t oid;
+            const char* rev = cli->cmd_argc>0? cli->cmd_argv[0]: "HEAD";
+            if (rev[0]=='-' ) rev="HEAD";
+            if (fastgit_rev_parse(repo, rev, &oid)!=FASTGIT_OK) { fprintf(stderr,"fatal: ambiguous argument '%s'\n", rev); fastgit_repository_free(repo); return 1; }
+            int limit=20; bool oneline=false;
+            for(int i=0;i<cli->cmd_argc;i++) if(strcmp(cli->cmd_argv[i],"--oneline")==0) oneline=true;
+            for(int n=0;n<limit;n++) {
+                fastgit_object_t* obj=NULL;
+                if (fastgit_object_lookup(repo,&oid,&obj)!=FASTGIT_OK) break;
+                const fastgit_commit_t* c = fastgit_commit_parse(obj);
+                char hex[129]; fastgit_oid_to_hex(&oid,hex,sizeof(hex));
+                if (oneline) printf("%s %s\n", hex, c&&c->message?c->message:"");
+                else {
+                    printf("commit %s\n", hex);
+                    if (c && c->author) printf("Author: %s <%s>\n", c->author->name, c->author->email);
+                    if (c && c->message) printf("\n    %s\n\n", c->message);
+                }
+                fastgit_oid_t next; bool has_next=false;
+                if (c && c->parent_count>0) { next=c->parents[0]; has_next=true; }
+                fastgit_object_free(obj);
+                if (!has_next) break;
+                oid=next;
+            }
+            fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_CHECKOUT: {
+            if (cli->cmd_argc<1) { fprintf(stderr,"usage: fastgit checkout <branch> [<paths>...]\n"); return 1; }
+            // handle -- separator for pathspec checkout
+            int arg_off=0;
+            const char* target = cli->cmd_argv[0];
+            int path_start=-1;
+            if (strcmp(target,"--")==0) {
+                // checkout -- <paths>: restore paths from index/HEAD
+                arg_off=1;
+                path_start=1;
+                target=NULL;
+            } else if (cli->cmd_argc>=2 && strcmp(cli->cmd_argv[1],"--")==0) {
+                path_start=2;
+            }
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a git repository\n"); return 1; }
+            if (path_start>=0) {
+                // path checkout: restore listed paths from index
+                fastgit_index_t* idx = fastgit_repository_index(repo);
+                fastgit_odb_t* odb = fastgit_repository_odb(repo);
+                const char* wt_path = fastgit_repository_worktree(repo) ? "." : ".";
+                (void)wt_path;
+                for(int i=path_start;i<cli->cmd_argc;i++) {
+                    const char* pth = cli->cmd_argv[i];
+                    fastgit_index_entry_t* ent=NULL;
+                    if (fastgit_index_find(idx, pth, 0, &ent)!=FASTGIT_OK || !ent) { fprintf(stderr,"error: pathspec '%s' did not match\n", pth); continue; }
+                    fastgit_object_t* blob=NULL;
+                    if (fastgit_object_lookup(repo,&ent->oid,&blob)==FASTGIT_OK) {
+                        size_t sz = fastgit_object_size(blob); const void* data = fastgit_object_data(blob);
+                        char* dup=strdup(pth); char* sl=strrchr(dup,'/');
+                        if (sl) { *sl='\0'; char cmd[1024]; snprintf(cmd,sizeof(cmd),"mkdir -p \"%s\"",dup); system(cmd); }
+                        free(dup);
+                        FILE* f=fopen(pth,"wb"); if(f){ fwrite(data,1,sz,f); fclose(f); }
+                        fastgit_object_free(blob);
+                    }
+                }
+                fastgit_repository_free(repo); return 0;
+            }
+            // branch checkout
+            if (strcmp(target,"--")==0) { fastgit_repository_free(repo); return 1; }
+            (void)arg_off;
+            fastgit_oid_t oid;
+            if (fastgit_rev_parse(repo,target,&oid)!=FASTGIT_OK) {
+                fprintf(stderr,"error: pathspec '%s' did not match\n", target);
+                fastgit_repository_free(repo); return 1;
+            }
+            fastgit_object_t* obj=NULL;
+            if (fastgit_object_lookup(repo,&oid,&obj)!=FASTGIT_OK) { fastgit_repository_free(repo); return 1; }
+            fastgit_oid_t tree_oid = oid;
+            const fastgit_commit_t* c = fastgit_commit_parse(obj);
+            if (c) tree_oid = c->tree;
+            fastgit_index_t* idx = fastgit_repository_index(repo);
+            fastgit_index_read_tree(idx, &tree_oid);
+            fastgit_index_write(idx);
+            fastgit_worktree_t* wt = fastgit_repository_worktree(repo);
+            fastgit_checkout_head(wt, true);
+            fastgit_reference_update(repo,"HEAD",&oid,target);
+            fastgit_object_free(obj); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_BRANCH: {
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a git repository\n"); return 1; }
+            if (cli->cmd_argc==0) {
+                char** list; size_t cnt;
+                fastgit_reference_list(repo,NULL,&list,&cnt);
+                for(size_t i=0;i<cnt;i++) {
+                    // list entries are like heads/main or refs/heads/main depending on source
+                    const char* n=list[i];
+                    if(strncmp(n,"refs/heads/",11)==0) n+=11;
+                    else if(strncmp(n,"heads/",6)==0) n+=6;
+                    // filter to heads only
+                    if(strstr(list[i],"heads/")) printf("  %s\n", n);
+                }
+                fastgit_reference_list_free(list,cnt);
+            } else if (cli->cmd_argc>=1 && strcmp(cli->cmd_argv[0],"-d")==0 && cli->cmd_argc>=2) {
+                char ref[512]; snprintf(ref,sizeof(ref),"refs/heads/%s",cli->cmd_argv[1]);
+                fastgit_reference_remove(repo,ref);
+            } else {
+                const char* name=cli->cmd_argv[0]; const char* start = cli->cmd_argc>=2? cli->cmd_argv[1]:"HEAD";
+                fastgit_oid_t oid; if(fastgit_rev_parse(repo,start,&oid)!=FASTGIT_OK){fprintf(stderr,"fatal: bad start %s\n",start); fastgit_repository_free(repo); return 1;}
+                char ref[512]; snprintf(ref,sizeof(ref),"refs/heads/%s",name);
+                fastgit_reference_create(repo,ref,&oid,false,"branch");
+            }
+            fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_DIFF: {
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a git repository\n"); return 1; }
+            const char* path = cli->cmd_argc>=1 && cli->cmd_argv[0][0]!='-' ? cli->cmd_argv[0] : NULL;
+            fastgit_worktree_t* wt = fastgit_repository_worktree(repo);
+            char* out=NULL; fastgit_diff_worktree(wt, path, &out);
+            if (out) { printf("%s", out); free(out); }
+            fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_LS_FILES: {
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a git repository\n"); return 1; }
+            fastgit_index_t* idx = fastgit_repository_index(repo);
+            size_t n = fastgit_index_entry_count(idx);
+            for(size_t i=0;i<n;i++) { const fastgit_index_entry_t* e = fastgit_index_entry_by_index(idx,i); if(e) printf("%s\n", e->path); }
+            fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_LS_TREE: {
+            if (cli->cmd_argc<1){fprintf(stderr,"usage: fastgit ls-tree <tree-ish>\n");return 1;}
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            fastgit_oid_t oid; if(fastgit_rev_parse(repo,cli->cmd_argv[0],&oid)!=FASTGIT_OK){fprintf(stderr,"fatal: bad tree %s\n",cli->cmd_argv[0]);fastgit_repository_free(repo);return 1;}
+            fastgit_object_t* obj=NULL; if(fastgit_object_lookup(repo,&oid,&obj)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}
+            fastgit_obj_type_t t=fastgit_object_type(obj);
+            if(t==FASTGIT_OBJ_COMMIT){ const fastgit_commit_t* c=fastgit_commit_parse(obj); if(c) oid=c->tree; fastgit_object_free(obj); if(fastgit_object_lookup(repo,&oid,&obj)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}}
+            size_t cnt=fastgit_tree_entry_count(obj);
+            for(size_t i=0;i<cnt;i++){ const fastgit_tree_entry_t* e=fastgit_tree_entry_by_index(obj,i); char hex[129]; fastgit_oid_to_hex(&e->oid,hex,sizeof(hex)); const char* tname = (e->mode == 040000 || (e->mode & 0170000) == 0040000) ? fastgit_obj_type_name(FASTGIT_OBJ_TREE) : fastgit_obj_type_name(FASTGIT_OBJ_BLOB); printf("%06o %s %s\t%s\n", e->mode, tname, hex, e->path); }
+            fastgit_object_free(obj); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_WRITE_TREE: {
+            fastgit_repository_t* repo=NULL;
+            if (fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            fastgit_oid_t oid; if(fastgit_index_write_tree(fastgit_repository_index(repo),&oid)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}
+            char hex[129]; fastgit_oid_to_hex(&oid,hex,sizeof(hex)); printf("%s\n",hex); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_READ_TREE: {
+            if(cli->cmd_argc<1){fprintf(stderr,"usage: fastgit read-tree <tree-ish>\n");return 1;}
+            fastgit_repository_t* repo=NULL;
+            if(fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            fastgit_oid_t oid; if(fastgit_rev_parse(repo,cli->cmd_argv[0],&oid)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}
+            fastgit_index_read_tree(fastgit_repository_index(repo),&oid);
+            fastgit_index_write(fastgit_repository_index(repo));
+            fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_COMMIT_TREE: {
+            if(cli->cmd_argc<1){fprintf(stderr,"usage: fastgit commit-tree <tree> [-p <parent>] [-m <msg>]\n");return 1;}
+            fastgit_repository_t* repo=NULL; fastgit_repository_open(".", &repo);
+            fastgit_oid_t tree; fastgit_oid_from_hex(cli->cmd_argv[0],&tree);
+            const char* msg="commit-tree"; fastgit_oid_t parent; bool has_p=false;
+            for(int i=1;i<cli->cmd_argc;i++) if(strcmp(cli->cmd_argv[i],"-p")==0 && i+1<cli->cmd_argc) {fastgit_oid_from_hex(cli->cmd_argv[++i],&parent); has_p=true;} else if(strcmp(cli->cmd_argv[i],"-m")==0 && i+1<cli->cmd_argc) msg=cli->cmd_argv[++i];
+            fastgit_signature_t *a=NULL,*c=NULL; fastgit_signature_default(&a); fastgit_signature_default(&c);
+            fastgit_commit_t ct={0}; ct.tree=tree; if(has_p){ct.parent_count=1; ct.parents=&parent;} ct.author=a; ct.committer=c; ct.message=(char*)msg;
+            fastgit_object_t* obj=NULL; fastgit_commit_create(&ct,&obj);
+            fastgit_buf_t buf; fastgit_object_serialize(obj,FASTGIT_HASH_SHA256,&buf);
+            fastgit_odb_t* odb=repo? fastgit_repository_odb(repo):NULL;
+            fastgit_oid_t woid; if(odb) fastgit_odb_write(odb,FASTGIT_OBJ_COMMIT,buf.data,buf.len,&woid); else { fastgit_hash(FASTGIT_HASH_SHA256,buf.data,buf.len,(fastgit_hash_t*)&woid); woid.algo=FASTGIT_HASH_SHA256; woid.len=32; }
+            char hex[129]; fastgit_oid_to_hex(&woid,hex,sizeof(hex)); printf("%s\n",hex);
+            free(buf.data); fastgit_object_free(obj); if(repo) fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_UPDATE_INDEX: {
+            fastgit_repository_t* repo=NULL; if(fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            fastgit_index_t* idx=fastgit_repository_index(repo);
+            for(int i=0;i<cli->cmd_argc;i++) if(cli->cmd_argv[i][0]!='-') fastgit_index_add(idx, cli->cmd_argv[i]);
+            fastgit_index_write(idx); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_RESET: {
+            if(cli->cmd_argc<1){fprintf(stderr,"usage: fastgit reset [<commit>]\n");return 1;}
+            fastgit_repository_t* repo=NULL; if(fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            fastgit_oid_t oid; if(fastgit_rev_parse(repo,cli->cmd_argv[0],&oid)!=FASTGIT_OK){fprintf(stderr,"fatal: bad rev\n");fastgit_repository_free(repo);return 1;}
+            fastgit_reference_update(repo,"HEAD",&oid,"reset");
+            // also reset index
+            fastgit_object_t* obj=NULL; if(fastgit_object_lookup(repo,&oid,&obj)==FASTGIT_OK){
+                fastgit_oid_t tree=oid; const fastgit_commit_t* c=fastgit_commit_parse(obj); if(c) tree=c->tree;
+                fastgit_index_read_tree(fastgit_repository_index(repo),&tree); fastgit_index_write(fastgit_repository_index(repo));
+                fastgit_object_free(obj);
+            }
+            fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_TAG: {
+            fastgit_repository_t* repo=NULL; if(fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            if(cli->cmd_argc==0){ char** l; size_t n; fastgit_reference_list(repo,"refs/tags/",&l,&n); for(size_t i=0;i<n;i++) printf("%s\n", l[i]+10); fastgit_reference_list_free(l,n); fastgit_repository_free(repo); return 0; }
+            const char* tname=cli->cmd_argv[0]; fastgit_oid_t oid; const char* target=cli->cmd_argc>=2?cli->cmd_argv[1]:"HEAD";
+            if(fastgit_rev_parse(repo,target,&oid)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}
+            char ref[512]; snprintf(ref,sizeof(ref),"refs/tags/%s",tname);
+            fastgit_reference_create(repo,ref,&oid,false,"tag"); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_RM: {
+            fastgit_repository_t* repo=NULL; if(fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            for(int i=0;i<cli->cmd_argc;i++) if(cli->cmd_argv[i][0]!='-'){ fastgit_index_remove(fastgit_repository_index(repo), cli->cmd_argv[i],0); unlink(cli->cmd_argv[i]); }
+            fastgit_index_write(fastgit_repository_index(repo)); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_MV: {
+            if(cli->cmd_argc<2){fprintf(stderr,"usage: fastgit mv <src> <dst>\n");return 1;}
+            const char* src=cli->cmd_argv[0]; const char* dst=cli->cmd_argv[1];
+            if(rename(src,dst)!=0){perror("rename"); return 1;}
+            fastgit_repository_t* repo=NULL; if(fastgit_repository_open(".", &repo)==FASTGIT_OK){
+                fastgit_index_remove(fastgit_repository_index(repo),src,0);
+                fastgit_index_add(fastgit_repository_index(repo),dst);
+                fastgit_index_write(fastgit_repository_index(repo));
+                fastgit_repository_free(repo);
+            }
+            return 0;
+        }
+        case FASTGIT_CMD_SHOW: {
+            const char* rev=cli->cmd_argc>0?cli->cmd_argv[0]:"HEAD";
+            fastgit_repository_t* repo=NULL; if(fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
+            fastgit_oid_t oid; if(fastgit_rev_parse(repo,rev,&oid)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}
+            fastgit_object_t* obj=NULL; if(fastgit_object_lookup(repo,&oid,&obj)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}
+            fwrite(fastgit_object_data(obj),1,fastgit_object_size(obj),stdout);
+            fastgit_object_free(obj); fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_CONFIG: {
+            if(cli->cmd_argc==1){ char* v=NULL; if(fastgit_config_get(cli->cmd_argv[0],&v)==FASTGIT_OK){printf("%s\n",v); free(v);} else {fprintf(stderr,"not found\n"); return 1; } return 0; }
+            if(cli->cmd_argc==2){ fastgit_config_set(cli->cmd_argv[0], cli->cmd_argv[1], "local"); return 0; }
+            fprintf(stderr,"usage: fastgit config <key> [<value>]\n"); return 1;
         }
         case FASTGIT_CMD_VERSION: {
             printf("fastgit version %s\n", fastgit_version());

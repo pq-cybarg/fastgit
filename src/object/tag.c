@@ -140,9 +140,9 @@ static __attribute__((unused)) void tag_serialize_write(const struct fastgit_tag
     }
 }
 
-size_t fastgit_tag_content_size(const fastgit_object_t* obj) {
-    return tag_serialize_size((const struct fastgit_tag*)obj->data);
+size_t fastgit_tag_content_size(const struct fastgit_tag* t) {
+    return tag_serialize_size(t);
 }
-void fastgit_tag_content_write(const fastgit_object_t* obj, uint8_t* buf, size_t* pos) {
-    tag_serialize_write((const struct fastgit_tag*)obj->data, buf, pos);
+void fastgit_tag_content_write(const struct fastgit_tag* t, uint8_t* buf, size_t* pos) {
+    tag_serialize_write(t, buf, pos);
 }

@@ -88,23 +88,73 @@ fastgit_error_t fastgit_tree_remove_entry(fastgit_object_t* tree_obj, const char
     return FASTGIT_ENOENT;
 }
 
+static fastgit_error_t tree_parse_raw(const void* data, size_t len, struct fastgit_tree** out) {
+    struct fastgit_tree* t = calloc(1, sizeof(*t));
+    if (!t) return FASTGIT_ENOMEM;
+    size_t pos = 0;
+    while (pos < len) {
+        const char* mode_start = (const char*)data + pos;
+        const char* sp = memchr(mode_start, ' ', len - pos);
+        if (!sp) { tree_data_free(t); return FASTGIT_EINVAL; }
+        char mode_buf[16];
+        size_t ml = sp - mode_start;
+        if (ml >= sizeof(mode_buf)) { tree_data_free(t); return FASTGIT_EINVAL; }
+        memcpy(mode_buf, mode_start, ml);
+        mode_buf[ml] = '\0';
+        uint32_t mode = (uint32_t)strtoul(mode_buf, NULL, 8);
+        pos += ml + 1;
+        const char* path_start = (const char*)data + pos;
+        const char* nul = memchr(path_start, '\0', len - pos);
+        if (!nul) { tree_data_free(t); return FASTGIT_EINVAL; }
+        size_t path_len = nul - path_start;
+        if (pos + path_len + 1 + 32 > len) { tree_data_free(t); return FASTGIT_EINVAL; }
+        if (t->count >= t->capacity) {
+            size_t nc = t->capacity ? t->capacity*2 : 16;
+            fastgit_tree_entry_t* ne = realloc(t->entries, nc*sizeof(*ne));
+            if (!ne) { tree_data_free(t); return FASTGIT_ENOMEM; }
+            t->entries = ne; t->capacity = nc;
+        }
+        fastgit_tree_entry_t* e = &t->entries[t->count++];
+        e->mode = mode;
+        e->path = strndup(path_start, path_len);
+        if (!e->path) { tree_data_free(t); return FASTGIT_ENOMEM; }
+        e->oid.len = 32; e->oid.algo = FASTGIT_HASH_SHA256;
+        memcpy(e->oid.hash, nul+1, 32);
+        pos += path_len + 1 + 32;
+    }
+    qsort(t->entries, t->count, sizeof(fastgit_tree_entry_t), tree_entry_cmp);
+    *out = t;
+    return FASTGIT_OK;
+}
+
+static struct fastgit_tree* ensure_tree_parsed(const fastgit_object_t* tree_obj) {
+    if (!tree_obj || tree_obj->type != FASTGIT_OBJ_TREE) return NULL;
+    if (tree_obj->size == 0) return (struct fastgit_tree*)tree_obj->data;
+    struct fastgit_tree* t = NULL;
+    if (tree_parse_raw(tree_obj->data, tree_obj->size, &t) != FASTGIT_OK) return NULL;
+    fastgit_object_t* m = (fastgit_object_t*)tree_obj;
+    free(m->data);
+    m->data = t;
+    m->free_data = tree_data_free;
+    m->size = 0;
+    return t;
+}
+
 size_t fastgit_tree_entry_count(const fastgit_object_t* tree_obj) {
-    if (!tree_obj || tree_obj->type != FASTGIT_OBJ_TREE) return 0;
-    struct fastgit_tree* tree = (struct fastgit_tree*)tree_obj->data;
+    struct fastgit_tree* tree = ensure_tree_parsed(tree_obj);
+    if (!tree) return 0;
     return tree->count;
 }
 
 const fastgit_tree_entry_t* fastgit_tree_entry_by_index(const fastgit_object_t* tree_obj, size_t index) {
-    if (!tree_obj || tree_obj->type != FASTGIT_OBJ_TREE) return NULL;
-    struct fastgit_tree* tree = (struct fastgit_tree*)tree_obj->data;
-    if (index >= tree->count) return NULL;
+    struct fastgit_tree* tree = ensure_tree_parsed(tree_obj);
+    if (!tree || index >= tree->count) return NULL;
     return &tree->entries[index];
 }
 
 const fastgit_tree_entry_t* fastgit_tree_entry_by_name(const fastgit_object_t* tree_obj, const char* path) {
-    if (!tree_obj || tree_obj->type != FASTGIT_OBJ_TREE || !path) return NULL;
-    struct fastgit_tree* tree = (struct fastgit_tree*)tree_obj->data;
-
+    struct fastgit_tree* tree = ensure_tree_parsed(tree_obj);
+    if (!tree || !path) return NULL;
     fastgit_tree_entry_t key = { .path = (char*)path };
     return bsearch(&key, tree->entries, tree->count, sizeof(fastgit_tree_entry_t), tree_entry_cmp);
 }

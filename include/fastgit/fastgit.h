@@ -101,6 +101,15 @@ fastgit_error_t fastgit_diff_worktree(fastgit_worktree_t* wt, const char* path, 
 fastgit_error_t fastgit_merge(fastgit_repository_t* repo, const fastgit_oid_t* their_head, const fastgit_merge_options_t* opts);
 fastgit_error_t fastgit_rebase(fastgit_repository_t* repo, const fastgit_oid_t* upstream, const fastgit_rebase_options_t* opts);
 
+fastgit_error_t fastgit_reference_lookup(fastgit_repository_t* repo, const char* name, fastgit_oid_t* out);
+fastgit_error_t fastgit_reference_create(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* oid, bool force, const char* log_message);
+fastgit_error_t fastgit_reference_update(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* oid, const char* log_message);
+fastgit_error_t fastgit_reference_remove(fastgit_repository_t* repo, const char* name);
+fastgit_error_t fastgit_reference_list(fastgit_repository_t* repo, const char* pattern, char*** out, size_t* count);
+void fastgit_reference_list_free(char** list, size_t count);
+fastgit_error_t fastgit_rev_parse(fastgit_repository_t* repo, const char* spec, fastgit_oid_t* out);
+fastgit_error_t fastgit_rev_parse_single(fastgit_repository_t* repo, const char* spec, fastgit_oid_t* out);
+
 fastgit_error_t fastgit_clone(const char* url, const char* path, const char* ref);
 fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, const char* refspec);
 fastgit_error_t fastgit_push(fastgit_repository_t* repo, const char* remote, const char* refspec);

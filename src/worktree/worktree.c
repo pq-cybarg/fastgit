@@ -279,20 +279,6 @@ static fastgit_error_t status_compare_entry(fastgit_worktree_t* wt, const fastgi
         return FASTGIT_OK;
     }
 
-    /* racily-clean: if mtime + size match index, assume clean without hashing (git optimization) */
-    if ((uint32_t)st.st_mtime == entry->mtime_sec && (uint32_t)st.st_size == entry->size && st.st_size != 0) {
-        *out = calloc(1, sizeof(fastgit_status_entry_t));
-        if (!*out) return FASTGIT_ENOMEM;
-        (*out)->path = strdup(entry->path);
-        (*out)->index_oid = entry->oid;
-        (*out)->worktree_oid = entry->oid;
-        (*out)->index_mode = entry->mode;
-        (*out)->worktree_mode = st.st_mode & 0777;
-        (*out)->index_status = FASTGIT_STATUS_CURRENT;
-        (*out)->worktree_status = FASTGIT_STATUS_CURRENT;
-        return FASTGIT_OK;
-    }
-
     int fd = open(full_path, O_RDONLY);
     if (fd < 0) {
         *out = calloc(1, sizeof(fastgit_status_entry_t));
@@ -308,21 +294,6 @@ static fastgit_error_t status_compare_entry(fastgit_worktree_t* wt, const fastgi
     struct stat fst;
     fstat(fd, &fst);
     size_t file_size = fst.st_size;
-
-    /* second mtime/size check using fresh fstat in case of race */
-    if ((uint32_t)fst.st_mtime == entry->mtime_sec && (uint32_t)fst.st_size == entry->size && fst.st_size != 0) {
-        close(fd);
-        *out = calloc(1, sizeof(fastgit_status_entry_t));
-        if (!*out) return FASTGIT_ENOMEM;
-        (*out)->path = strdup(entry->path);
-        (*out)->index_oid = entry->oid;
-        (*out)->worktree_oid = entry->oid;
-        (*out)->index_mode = entry->mode;
-        (*out)->worktree_mode = st.st_mode & 0777;
-        (*out)->index_status = FASTGIT_STATUS_CURRENT;
-        (*out)->worktree_status = FASTGIT_STATUS_CURRENT;
-        return FASTGIT_OK;
-    }
 
     void* data = malloc(file_size ? file_size : 1);
     if (!data) {

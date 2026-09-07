@@ -59,11 +59,10 @@ fastgit_error_t fastgit_object_serialize(const fastgit_object_t* obj, uint8_t ha
 
     // Dispatch to typed serializers if object holds structured data (size==0 indicates structured)
     if (obj->type == FASTGIT_OBJ_COMMIT && obj->size == 0) {
-        const struct fastgit_commit* c = (const struct fastgit_commit*)obj->data;
+        const fastgit_commit_t* c = (const fastgit_commit_t*)obj->data;
         if (c) {
-            // call commit helpers (now non-static via extern)
-            extern size_t fastgit_commit_content_size(const struct fastgit_commit* c);
-            extern void fastgit_commit_content_write(const struct fastgit_commit* c, uint8_t* buf, size_t* pos);
+            extern size_t fastgit_commit_content_size(const fastgit_commit_t* c);
+            extern void fastgit_commit_content_write(const fastgit_commit_t* c, uint8_t* buf, size_t* pos);
             content_len = fastgit_commit_content_size(c);
             content_buf = malloc(content_len);
             if (!content_buf) return FASTGIT_ENOMEM;
