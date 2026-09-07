@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #endif
 
 struct fastgit_midx {
@@ -30,8 +31,78 @@ struct fastgit_midx {
     fastgit_hash_t checksum;
 };
 
-fastgit_error_t fastgit_midx_create(const char* midx_file __attribute__((unused)), const char** pack_dirs __attribute__((unused)), size_t dir_count __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+typedef struct { fastgit_oid_t oid; uint8_t pack_idx; uint64_t offset; } midx_entry_t;
+static int midx_entry_cmp(const void* a, const void* b) {
+    return memcmp(((const midx_entry_t*)a)->oid.hash, ((const midx_entry_t*)b)->oid.hash, 32);
+}
+
+fastgit_error_t fastgit_midx_create(const char* midx_file, const char** pack_dirs, size_t dir_count) {
+    if (!midx_file || !pack_dirs) return FASTGIT_EINVAL;
+    size_t cap = 1024, count = 0;
+    midx_entry_t* entries = malloc(cap * sizeof(midx_entry_t));
+    if (!entries) return FASTGIT_ENOMEM;
+    size_t pack_count = 0;
+    for (size_t d = 0; d < dir_count; d++) {
+        const char* dir = pack_dirs[d];
+        if (!dir) continue;
+        pack_count++;
+    }
+    // collect from each dir
+    size_t pack_idx = 0;
+    for (size_t d = 0; d < dir_count; d++) {
+        const char* dir = pack_dirs[d];
+        if (!dir) continue;
+        DIR* dp = opendir(dir);
+        if (!dp) continue;
+        struct dirent* de;
+        while ((de = readdir(dp)) != NULL) {
+            size_t len = strlen(de->d_name);
+            if (len < 4 || strcmp(de->d_name + len - 4, ".idx") != 0) continue;
+            char idx_path[4096];
+            snprintf(idx_path, sizeof(idx_path), "%s/%s", dir, de->d_name);
+            fastgit_pack_index_t* idx = NULL;
+            if (fastgit_pack_index_load(idx_path, &idx) != FASTGIT_OK) continue;
+            const fastgit_pack_index_data_t* data = fastgit_pack_index_data(idx);
+            for (uint32_t i = 0; i < data->count; i++) {
+                if (count >= cap) {
+                    cap *= 2;
+                    midx_entry_t* n = realloc(entries, cap * sizeof(midx_entry_t));
+                    if (!n) { fastgit_pack_index_free(idx); closedir(dp); free(entries); return FASTGIT_ENOMEM; }
+                    entries = n;
+                }
+                entries[count].oid = data->oids[i];
+                entries[count].pack_idx = (uint8_t)pack_idx;
+                entries[count].offset = data->offsets ? data->offsets[i] : 0;
+                count++;
+            }
+            fastgit_pack_index_free(idx);
+        }
+        closedir(dp);
+        pack_idx++;
+    }
+    if (count == 0) { free(entries); return FASTGIT_ENOENT; }
+    qsort(entries, count, sizeof(midx_entry_t), midx_entry_cmp);
+    // fanout cumulative
+    uint32_t fanout[256] = {0};
+    for (size_t i = 0; i < count; i++) fanout[entries[i].oid.hash[0]]++;
+    uint32_t cum = 0;
+    for (int i = 0; i < 256; i++) { cum += fanout[i]; fanout[i] = cum; }
+    int fd = open(midx_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { free(entries); return FASTGIT_EIO; }
+    uint32_t sig = __builtin_bswap32(0x4D494458);
+    uint32_t ver = __builtin_bswap32(1);
+    uint32_t pc = __builtin_bswap32((uint32_t)pack_count);
+    if (write(fd, &sig, 4) != 4 || write(fd, &ver, 4) != 4 || write(fd, &pc, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; }
+    for (size_t i = 0; i < pack_count; i++) { uint32_t pid = __builtin_bswap32((uint32_t)i); if (write(fd, &pid, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
+    for (int i = 0; i < 256; i++) { uint32_t v = __builtin_bswap32(fanout[i]); if (write(fd, &v, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
+    for (size_t i = 0; i < count; i++) if (write(fd, entries[i].oid.hash, 32) != 32) { close(fd); free(entries); return FASTGIT_EIO; }
+    for (size_t i = 0; i < count; i++) { uint8_t p = entries[i].pack_idx; if (write(fd, &p, 1) != 1) { close(fd); free(entries); return FASTGIT_EIO; } }
+    for (size_t i = 0; i < count; i++) { uint32_t off = __builtin_bswap32((uint32_t)entries[i].offset); if (write(fd, &off, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
+    uint8_t checksum[32] = {0};
+    if (write(fd, checksum, 32) != 32) { close(fd); free(entries); return FASTGIT_EIO; }
+    close(fd);
+    free(entries);
+    return FASTGIT_OK;
 }
 
 fastgit_error_t fastgit_midx_open(const char* midx_file, fastgit_midx_t** out) {
