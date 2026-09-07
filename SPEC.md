@@ -42,7 +42,8 @@ CMake 3.20+ C23. Options `FASTGIT_NATIVE_OPT` (OFF default, enables `-march=nati
 
 ## 8. Benchmarks & Correctness
 - `ctest` 10 suites; `bench_hash/odb/index/pack/diff/full`.
-- Targets: ODB write >1M/s read >5M/s, index add >2M/s, hash ~1.6GB/s SHA-256.
+- Targets: hash ~1.6GB/s SHA-256 (achieved via OpenSSL), index add >2M/s in-memory (achieved ~3M/s), ODB hot-cache >1M/s (achieved ~0.6–1M/s hot, ~10k/s durable distinct via zlib+write), ODB read ~2–19M/s.
+- Durable proof requires `fsync` + cold-cache + 1M-object `bench_full`; current `bench_odb` reports both hot and durable distinctly.
 - KATs: `tests/test_kat` NIST vectors for SHA-256/384/SHA3 (abc, empty, long). Must pass on CI.
 
 ## 9. Roadmap to beat git (§10 honest status)

@@ -31,6 +31,7 @@ int main(void) {
 
     struct timespec start, end;
 
+    /* Hot write: same blob repeatedly — hits 16K ODB cache after first, measures cache path. */
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < ITERATIONS; i++) {
         fastgit_oid_t oid;
@@ -38,25 +39,49 @@ int main(void) {
         assert(err == FASTGIT_OK);
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
+    double write_hot_ms = time_diff(start, end);
+    printf("Write (hot cache, same blob): %8.2f ms  %10.0f ops/s\n", write_hot_ms, ITERATIONS / (write_hot_ms / 1000.0));
 
-    double write_ms = time_diff(start, end);
-    printf("Write: %8.2f ms  %10.0f ops/s\n", write_ms, ITERATIONS / (write_ms / 1000.0));
+    /* Durable write: distinct blobs — cache misses, measures serialize+zlib+write. */
+    fastgit_oid_t *oids = malloc(ITERATIONS * sizeof(fastgit_oid_t));
+    assert(oids != NULL);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < ITERATIONS; i++) {
+        data[0] = (char)(i & 0xFF);
+        data[1] = (char)((i >> 8) & 0xFF);
+        data[2] = (char)((i >> 16) & 0xFF);
+        data[3] = (char)((i >> 24) & 0xFF);
+        err = fastgit_odb_write(odb, FASTGIT_OBJ_BLOB, data, 1024, &oids[i]);
+        assert(err == FASTGIT_OK);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double write_cold_ms = time_diff(start, end);
+    printf("Write (durable distinct):     %8.2f ms  %10.0f ops/s\n", write_cold_ms, ITERATIONS / (write_cold_ms / 1000.0));
 
-    fastgit_oid_t oid;
-    err = fastgit_odb_write(odb, FASTGIT_OBJ_BLOB, data, 1024, &oid);
-    assert(err == FASTGIT_OK);
-
+    /* Hot read: same OID — hits cache. */
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < ITERATIONS; i++) {
         fastgit_odb_object_t obj;
-        err = fastgit_odb_read(odb, &oid, &obj);
+        err = fastgit_odb_read(odb, &oids[0], &obj);
         assert(err == FASTGIT_OK);
         free(obj.data);
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
+    double read_hot_ms = time_diff(start, end);
+    printf("Read  (hot cache):            %8.2f ms  %10.0f ops/s\n", read_hot_ms, ITERATIONS / (read_hot_ms / 1000.0));
 
-    double read_ms = time_diff(start, end);
-    printf("Read:  %8.2f ms  %10.0f ops/s\n", read_ms, ITERATIONS / (read_ms / 1000.0));
+    /* Cold-ish read: distinct OIDs sequentially — less cache locality. */
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < ITERATIONS; i++) {
+        fastgit_odb_object_t obj;
+        err = fastgit_odb_read(odb, &oids[i], &obj);
+        assert(err == FASTGIT_OK);
+        free(obj.data);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double read_cold_ms = time_diff(start, end);
+    printf("Read  (distinct):             %8.2f ms  %10.0f ops/s\n", read_cold_ms, ITERATIONS / (read_cold_ms / 1000.0));
+    free(oids);
 
     fastgit_odb_free(odb);
     free(data);

@@ -24,11 +24,13 @@ Scope: nothing is out of scope. v0.2 ships loose ODB + index + hash (see §9); p
 
 ## Performance (measured on Apple M-series, portable build — §9, not chromium on bandwidth)
 
-| Operation | Measured |
-|-----------|----------|
-| `hash-object` (SHA-256) | ~1700 MB/s |
-| ODB write / read (hot) | ~1.1M / ~28M ops/s |
-| index add (bulk, with hashing) | ~11M entries/s |
+| Operation | Measured | Notes |
+|-----------|----------|-------|
+| `hash-object` (SHA-256) | ~1830 MB/s | OpenSSL EVP when available |
+| ODB write (hot cache, same blob) | ~0.6–1.0M ops/s | 16K cache hit, no serialize/write |
+| ODB write (durable distinct) | ~10k ops/s | serialize+zlib+open/write per object |
+| ODB read (hot / distinct) | ~19M / ~2.3M ops/s | cache vs loose zlib inflate |
+| index add/find/remove | ~3.0M / 3.2M / 5.5M ops/s | in-memory; bulk add with hashing |
 
 ## Building
 
