@@ -1,0 +1,23 @@
+[package]
+name = "fastgit-sys"
+version = "0.1.1"
+edition = "2021"
+description = "Bare-metal C git reimplementation - bindings to libfastgit (SHA256/SHA384/SHA3, hash-agile 20/32/48/64, 38 verbs)"
+license = "MIT"
+repository = "https://github.com/pq-cybarg/fastgit"
+homepage = "https://github.com/pq-cybarg/fastgit"
+keywords = ["git", "vcs", "sha256", "pqc"]
+categories = ["development-tools"]
+links = "fastgit"
+readme = "README.md"
+
+[lib]
+name = "fastgit_sys"
+crate-type = ["rlib"]
+
+[build-dependencies]
+cmake = "0.1"
+pkg-config = "0.5"
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

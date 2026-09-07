@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+override_dh_auto_configure:
+	cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFASTGIT_ENABLE_LTO=ON
+override_dh_auto_build:
+	cmake --build build -j$(nproc)
+override_dh_auto_test:
+	ctest --test-dir build --output-on-failure
+override_dh_auto_install:
+	cmake --install build --prefix debian/fastgit/usr

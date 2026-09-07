@@ -1,0 +1,14 @@
+Source: fastgit
+Section: vcs
+Priority: optional
+Maintainer: pq-cybarg <resistant@tuta.com>
+Build-Depends: debhelper-compat (= 13), cmake (>=3.20), pkg-config, libssl-dev, zlib1g-dev, libcurl4-openssl-dev, libssh-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/pq-cybarg/fastgit
+
+Package: fastgit
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Bare-metal C git reimplementation - hash-agile SHA256, 38 verbs, pack batch
+ Fast, portable `git` in C23 with OpenSSL acceleration, libcurl/libssh
+ transports. Interoperates with `git cat-file` via objectFormat=sha256.

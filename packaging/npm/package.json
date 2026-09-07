@@ -1,0 +1,15 @@
+{
+  "name": "fastgit",
+  "version": "0.1.1",
+  "description": "Bare-metal C git reimplementation — Node bindings to libfastgit (hash-agile SHA256, 38 verbs, pack batch)",
+  "main": "index.js",
+  "gypfile": true,
+  "scripts": { "install": "node-gyp rebuild", "test": "node index.test.js" },
+  "repository": { "type": "git", "url": "https://github.com/pq-cybarg/fastgit.git" },
+  "homepage": "https://github.com/pq-cybarg/fastgit#readme",
+  "license": "MIT",
+  "author": "pq-cybarg <resistant@tuta.com>",
+  "keywords": ["git", "vcs", "sha256", "native"],
+  "os": ["darwin", "linux", "win32"],
+  "engines": { "node": ">=16" }
+}
