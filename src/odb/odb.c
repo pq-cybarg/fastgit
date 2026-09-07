@@ -656,10 +656,45 @@ void fastgit_odb_stats_reset(fastgit_odb_t* odb) {
     odb->stats_cache_misses = 0;
 }
 
-fastgit_error_t fastgit_odb_pack(fastgit_odb_t* odb __attribute__((unused)), const fastgit_oid_t* objects __attribute__((unused)), size_t count __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+fastgit_error_t fastgit_odb_pack(fastgit_odb_t* odb, const fastgit_oid_t* objects, size_t count) {
+    if (!odb) return FASTGIT_EINVAL;
+    char pack_dir[1024]; snprintf(pack_dir,sizeof(pack_dir),"%s/pack", odb->path);
+    mkdir(pack_dir, 0755);
+    char pack_path[1024], idx_path[1024];
+    if (objects && count>0) {
+        fastgit_pack_t* pk=NULL; char tmp[64]; fastgit_oid_to_hex(&objects[0],tmp,sizeof(tmp));
+        snprintf(pack_path,sizeof(pack_path),"%s/pack-%.12s.pack", pack_dir, tmp);
+        snprintf(idx_path,sizeof(idx_path),"%s/pack-%.12s.idx", pack_dir, tmp);
+        fastgit_error_t err = fastgit_pack_create(pack_path, idx_path, &pk);
+        if (err!=FASTGIT_OK) return err;
+        for (size_t i=0;i<count;i++) {
+            fastgit_object_t* obj=NULL; if (fastgit_odb_read(odb,&objects[i],&obj)!=FASTGIT_OK) continue;
+            const void* data=fastgit_object_data(obj); size_t len=fastgit_object_size(obj); fastgit_obj_type_t t=fastgit_object_type(obj);
+            fastgit_oid_t out; fastgit_pack_add_object(pk,t,data,len,&out);
+            fastgit_object_free(obj);
+        }
+        fastgit_pack_close(pk);
+        return FASTGIT_OK;
+    }
+    /* pack all loose */
+    fastgit_odb_iterator_t* it=NULL; if (fastgit_odb_iterator_new(odb,&it)!=FASTGIT_OK) return FASTGIT_ENOMEM;
+    size_t cap=1024, n=0; fastgit_oid_t* list=malloc(cap*sizeof(fastgit_oid_t));
+    fastgit_oid_t oid; while (fastgit_odb_iterator_next(it,&oid)==FASTGIT_OK) { if(n>=cap){cap*=2; list=realloc(list,cap*sizeof(*list));} list[n++]=oid; }
+    fastgit_odb_iterator_free(it);
+    if (n==0){ free(list); return FASTGIT_OK; }
+    char hex[129]; fastgit_oid_to_hex(&list[0],hex,sizeof(hex));
+    snprintf(pack_path,sizeof(pack_path),"%s/pack-%.12s.pack", pack_dir, hex);
+    snprintf(idx_path,sizeof(idx_path),"%s/pack-%.12s.idx", pack_dir, hex);
+    fastgit_pack_t* pk=NULL; fastgit_error_t err=fastgit_pack_create(pack_path,idx_path,&pk);
+    if (err!=FASTGIT_OK){ free(list); return err; }
+    for (size_t i=0;i<n;i++){ fastgit_object_t* obj=NULL; if(fastgit_odb_read(odb,&list[i],&obj)!=FASTGIT_OK) continue; const void* d=fastgit_object_data(obj); size_t l=fastgit_object_size(obj); fastgit_oid_t out; fastgit_pack_add_object(pk,fastgit_object_type(obj),d,l,&out); fastgit_object_free(obj); }
+    free(list); fastgit_pack_close(pk); return FASTGIT_OK;
 }
 
-fastgit_error_t fastgit_odb_gc(fastgit_odb_t* odb __attribute__((unused))) {
-    return FASTGIT_EUNSUPPORTED;
+fastgit_error_t fastgit_odb_gc(fastgit_odb_t* odb) {
+    if (!odb) return FASTGIT_EINVAL;
+    fastgit_error_t err=fastgit_odb_pack(odb,NULL,0);
+    if (err!=FASTGIT_OK) return err;
+    /* optional: prune loose not yet – keep for safety */
+    return FASTGIT_OK;
 }
