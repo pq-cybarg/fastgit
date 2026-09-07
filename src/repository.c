@@ -187,6 +187,9 @@ fastgit_error_t fastgit_repository_open(const char* path, fastgit_repository_t**
     return FASTGIT_OK;
 }
 
+const char* fastgit_repository_path(fastgit_repository_t* repo) { return repo ? repo->path : NULL; }
+const char* fastgit_repository_gitdir(fastgit_repository_t* repo) { return repo ? repo->gitdir : NULL; }
+
 fastgit_error_t fastgit_repository_free(fastgit_repository_t* repo) {
     if (!repo) return FASTGIT_OK;
     if (repo->worktree) fastgit_worktree_free(repo->worktree);

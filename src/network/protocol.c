@@ -164,8 +164,42 @@ fastgit_error_t fastgit_remote_create(fastgit_repository_t* repo, const char* na
 }
 
 fastgit_error_t fastgit_remote_lookup(fastgit_repository_t* repo, const char* name, fastgit_remote_t** out) {
-    (void)repo; (void)name; (void)out;
-    return FASTGIT_ENOENT;
+    if (!repo || !name || !out) return FASTGIT_EINVAL;
+    // Read $gitdir/config for [remote "name"] url
+    char cfg_path[4096];
+    // Try to derive gitdir: use fastgit_repository_gitdir accessor if available, else probe
+    extern const char* fastgit_repository_gitdir(fastgit_repository_t* repo);
+    const char* gd = NULL;
+    // weak symbol: if accessor not linked yet, fallback
+    // Use dlsym-style not needed; we add accessor now so this compiles after header update
+    gd = fastgit_repository_gitdir(repo);
+    if (!gd) return FASTGIT_ENOENT;
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config", gd);
+    FILE* f = fopen(cfg_path, "r");
+    if (!f) return FASTGIT_ENOENT;
+    char line[4096];
+    bool in_section = false;
+    char want_sec[256]; snprintf(want_sec, sizeof(want_sec), "[remote \"%s\"]", name);
+    char url[4096] = {0};
+    while (fgets(line, sizeof(line), f)) {
+        // trim leading
+        char* p = line; while (*p==' '||*p=='\t') p++;
+        if (*p=='[') {
+            in_section = (strncmp(p, want_sec, strlen(want_sec))==0);
+        } else if (in_section) {
+            char* eq = strchr(p, '=');
+            if (!eq) continue;
+            char* k = p; char* v = eq+1;
+            while (*k==' '||*k=='\t') k++;
+            char* ke = eq-1; while (ke>k && (*ke==' '||*ke=='\t')) ke--; ke[1]=0;
+            while (*v==' '||*v=='\t') v++;
+            char* ve = v+strlen(v)-1; while (ve>v && (*ve=='\n'||*ve=='\r'||*ve==' '||*ve=='\t')) *ve--=0;
+            if (strcmp(k, "url")==0) { strncpy(url, v, sizeof(url)-1); break; }
+        }
+    }
+    fclose(f);
+    if (!url[0]) return FASTGIT_ENOENT;
+    return fastgit_remote_create(repo, name, url, out);
 }
 
 void fastgit_remote_free(fastgit_remote_t* remote) {
@@ -780,7 +814,8 @@ fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, co
     (void)refspec;
     if (!repo || !remote) return FASTGIT_EINVAL;
     fastgit_remote_t* r = NULL;
-    fastgit_error_t err = fastgit_remote_create(repo, remote, remote, &r);
+    fastgit_error_t err = fastgit_remote_lookup(repo, remote, &r);
+    if (err != FASTGIT_OK) err = fastgit_remote_create(repo, remote, remote, &r);
     if (err != FASTGIT_OK) return err;
     if (!fastgit_remote_circuit_allow(r)) { fastgit_remote_free(r); return FASTGIT_EBUSY; }
     if (!fastgit_remote_load_acquire(r)) { fastgit_remote_free(r); return FASTGIT_EBUSY; }
@@ -992,7 +1027,8 @@ static char* build_receive_pack_request(fastgit_repository_t* repo, fastgit_ref_
 fastgit_error_t fastgit_push(fastgit_repository_t* repo, const char* remote, const char* refspec) {
     if (!repo || !remote) return FASTGIT_EINVAL;
     fastgit_remote_t* r = NULL;
-    fastgit_error_t err = fastgit_remote_create(repo, remote, remote, &r);
+    fastgit_error_t err = fastgit_remote_lookup(repo, remote, &r);
+    if (err != FASTGIT_OK) err = fastgit_remote_create(repo, remote, remote, &r);
     if (err != FASTGIT_OK) return err;
     if (!fastgit_remote_circuit_allow(r)) { fastgit_remote_free(r); return FASTGIT_EBUSY; }
     if (!fastgit_remote_load_acquire(r)) { fastgit_remote_free(r); return FASTGIT_EBUSY; }

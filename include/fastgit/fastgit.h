@@ -75,6 +75,8 @@ fastgit_error_t fastgit_repository_free(fastgit_repository_t* repo);
 fastgit_odb_t* fastgit_repository_odb(fastgit_repository_t* repo);
 fastgit_index_t* fastgit_repository_index(fastgit_repository_t* repo);
 fastgit_worktree_t* fastgit_repository_worktree(fastgit_repository_t* repo);
+const char* fastgit_repository_path(fastgit_repository_t* repo);
+const char* fastgit_repository_gitdir(fastgit_repository_t* repo);
 
 fastgit_error_t fastgit_object_lookup(fastgit_repository_t* repo, const fastgit_oid_t* oid, fastgit_object_t** out);
 fastgit_error_t fastgit_object_free(fastgit_object_t* obj);
