@@ -92,10 +92,16 @@ fastgit_error_t fastgit_worktree_open(const char* path, fastgit_worktree_t** out
     snprintf(index_path, sizeof(index_path), "%s/index", wt->gitdir);
     fastgit_error_t err = fastgit_index_open(index_path, &wt->index);
     if (err != FASTGIT_OK) {
-        fastgit_worktree_free(wt);
-        return err;
+        if (fastgit_index_new(&wt->index) != FASTGIT_OK) {
+            fastgit_worktree_free(wt);
+            return err;
+        }
+        wt->index_owned = true;
+        free(wt->index->path);
+        wt->index->path = strdup(index_path);
+    } else {
+        wt->index_owned = true;
     }
-    wt->index_owned = true;
 
     char odb_path[1024];
     snprintf(odb_path, sizeof(odb_path), "%s/objects", wt->gitdir);

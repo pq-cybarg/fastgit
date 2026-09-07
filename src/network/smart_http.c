@@ -240,7 +240,42 @@ fastgit_error_t fastgit_http_post_upload_pack(fastgit_transport_t* transport, co
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
+    // Git smart HTTP uses x-git-upload-pack-result
+    struct curl_slist* hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-git-upload-pack-request");
+    hdrs = curl_slist_append(hdrs, "Accept: application/x-git-upload-pack-result");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     CURLcode rc = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, t->headers);
+    if (rc != CURLE_OK) return FASTGIT_EIO;
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    t->last_http_code = code;
+    if (code == 429 || code == 503) return FASTGIT_EAGAIN;
+    if (code >= 500) return FASTGIT_EAGAIN;
+    if (code >= 400) return FASTGIT_ERROR;
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_http_post_receive_pack(fastgit_transport_t* transport, const void* body, size_t len) {
+    if (!transport || !body) return FASTGIT_EINVAL;
+    struct fastgit_http_transport* t = (struct fastgit_http_transport*)transport;
+    CURL* curl = (CURL*)t->curl_handle;
+    char url[4096];
+    snprintf(url, sizeof(url), "%s/git-receive-pack", t->url);
+    http_reset_buffers(t);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)len);
+    struct curl_slist* hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-git-receive-pack-request");
+    hdrs = curl_slist_append(hdrs, "Accept: application/x-git-receive-pack-result");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    CURLcode rc = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, t->headers);
     if (rc != CURLE_OK) return FASTGIT_EIO;
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);

@@ -164,6 +164,7 @@ bool fastgit_http_has_valid_token(fastgit_transport_t* transport);
 fastgit_error_t fastgit_http_set_token(fastgit_transport_t* transport, const char* token, uint64_t expiry_ms);
 fastgit_error_t fastgit_http_get_info_refs(fastgit_transport_t* transport, const char* service);
 fastgit_error_t fastgit_http_post_upload_pack(fastgit_transport_t* transport, const void* body, size_t len);
+fastgit_error_t fastgit_http_post_receive_pack(fastgit_transport_t* transport, const void* body, size_t len);
 const char* fastgit_http_response_data(fastgit_transport_t* transport, size_t* out_len);
 long fastgit_http_last_status(fastgit_transport_t* transport);
 

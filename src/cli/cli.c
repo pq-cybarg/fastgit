@@ -11,6 +11,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <getopt.h>
+#include <unistd.h>
+#include <errno.h>
 
 struct fastgit_cli {
     int argc;
@@ -121,16 +123,42 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
         return 1;
     }
 
-    int cmd = find_command(cli->argv[1]);
+    // handle global options like -C <path> before command (git-compatible)
+    int arg = 1;
+    while (arg < cli->argc && cli->argv[arg][0] == '-') {
+        if (strcmp(cli->argv[arg], "-C") == 0 && arg + 1 < cli->argc) {
+            if (chdir(cli->argv[arg+1]) != 0) {
+                fprintf(stderr, "fatal: cannot chdir to '%s': %s\n", cli->argv[arg+1], strerror(errno));
+                return 1;
+            }
+            arg += 2;
+        } else if (strncmp(cli->argv[arg], "-C", 2) == 0 && cli->argv[arg][2] != '\0') {
+            const char* p = cli->argv[arg] + 2;
+            if (chdir(p) != 0) {
+                fprintf(stderr, "fatal: cannot chdir to '%s': %s\n", p, strerror(errno));
+                return 1;
+            }
+            arg += 1;
+        } else if (strcmp(cli->argv[arg], "--help") == 0 || strcmp(cli->argv[arg], "-h") == 0) {
+            print_usage(cli->argv[0]);
+            return 0;
+        } else {
+            break;
+        }
+        if (arg >= cli->argc) { print_usage(cli->argv[0]); return 1; }
+    }
+    if (arg >= cli->argc) { print_usage(cli->argv[0]); return 1; }
+
+    int cmd = find_command(cli->argv[arg]);
     if (cmd < 0) {
-        fprintf(stderr, "fastgit: '%s' is not a fastgit command.\n\n", cli->argv[1]);
+        fprintf(stderr, "fastgit: '%s' is not a fastgit command.\n\n", cli->argv[arg]);
         print_usage(cli->argv[0]);
         return 1;
     }
 
     cli->cmd = (fastgit_cmd_t)cmd;
-    cli->cmd_argc = cli->argc - 2;
-    cli->cmd_argv = cli->argv + 2;
+    cli->cmd_argc = cli->argc - arg - 1;
+    cli->cmd_argv = cli->argv + arg + 1;
 
     switch (cli->cmd) {
         case FASTGIT_CMD_INIT: {
@@ -437,7 +465,7 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             if (path_start>=0) {
                 // path checkout: restore listed paths from index
                 fastgit_index_t* idx = fastgit_repository_index(repo);
-                fastgit_odb_t* odb = fastgit_repository_odb(repo);
+                (void)fastgit_repository_odb(repo);
                 const char* wt_path = fastgit_repository_worktree(repo) ? "." : ".";
                 (void)wt_path;
                 for(int i=path_start;i<cli->cmd_argc;i++) {
@@ -639,6 +667,84 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             fastgit_error_t err = fastgit_rebase(repo, &oid, &opts);
             if (err != FASTGIT_OK) { fprintf(stderr, "rebase failed: %s\n", fastgit_error_string(err)); fastgit_repository_free(repo); return 1; }
             fastgit_repository_free(repo); return 0;
+        }
+        case FASTGIT_CMD_CLONE: {
+            if (cli->cmd_argc < 1) { fprintf(stderr, "usage: fastgit clone <repository> [<directory>]\n"); return 1; }
+            const char* url = cli->cmd_argv[0];
+            const char* path = cli->cmd_argc >= 2 ? cli->cmd_argv[1] : NULL;
+            char auto_path[1024] = {0};
+            if (!path) {
+                const char* slash = strrchr(url, '/');
+                const char* base = slash ? slash + 1 : url;
+                size_t blen = strlen(base);
+                if (blen > 4 && strcmp(base + blen - 4, ".git") == 0) blen -= 4;
+                if (blen >= sizeof(auto_path)) blen = sizeof(auto_path) - 1;
+                memcpy(auto_path, base, blen);
+                auto_path[blen] = '\0';
+                if (auto_path[0] == '\0') strcpy(auto_path, "fastgit-clone");
+                path = auto_path;
+            }
+            fastgit_error_t err = fastgit_clone(url, path, NULL);
+            if (err != FASTGIT_OK) { fprintf(stderr, "clone failed: %s\n", fastgit_error_string(err)); return 1; }
+            return 0;
+        }
+        case FASTGIT_CMD_FETCH: {
+            const char* remote = cli->cmd_argc >= 1 ? cli->cmd_argv[0] : "origin";
+            const char* refspec = cli->cmd_argc >= 2 ? cli->cmd_argv[1] : NULL;
+            fastgit_repository_t* repo = NULL;
+            if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+            fastgit_error_t err = fastgit_fetch(repo, remote, refspec);
+            if (err != FASTGIT_OK) fprintf(stderr, "fetch failed: %s\n", fastgit_error_string(err));
+            fastgit_repository_free(repo);
+            return err == FASTGIT_OK ? 0 : 1;
+        }
+        case FASTGIT_CMD_PUSH: {
+            const char* remote = cli->cmd_argc >= 1 ? cli->cmd_argv[0] : "origin";
+            const char* refspec = cli->cmd_argc >= 2 ? cli->cmd_argv[1] : NULL;
+            fastgit_repository_t* repo = NULL;
+            if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+            fastgit_error_t err = fastgit_push(repo, remote, refspec);
+            if (err != FASTGIT_OK) fprintf(stderr, "push failed: %s\n", fastgit_error_string(err));
+            fastgit_repository_free(repo);
+            return err == FASTGIT_OK ? 0 : 1;
+        }
+        case FASTGIT_CMD_PULL: {
+            const char* remote = cli->cmd_argc >= 1 ? cli->cmd_argv[0] : "origin";
+            const char* refspec = cli->cmd_argc >= 2 ? cli->cmd_argv[1] : NULL;
+            fastgit_repository_t* repo = NULL;
+            if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+            fastgit_error_t err = fastgit_fetch(repo, remote, refspec);
+            if (err == FASTGIT_OK) {
+                fastgit_oid_t oid;
+                if (fastgit_rev_parse(repo, "FETCH_HEAD", &oid) == FASTGIT_OK || fastgit_rev_parse(repo, "origin/main", &oid) == FASTGIT_OK || fastgit_rev_parse(repo, "origin/HEAD", &oid) == FASTGIT_OK) {
+                    err = fastgit_merge(repo, &oid, NULL);
+                }
+            }
+            if (err != FASTGIT_OK) fprintf(stderr, "pull failed: %s\n", fastgit_error_string(err));
+            fastgit_repository_free(repo);
+            return err == FASTGIT_OK ? 0 : 1;
+        }
+        case FASTGIT_CMD_REMOTE: {
+            if (cli->cmd_argc < 1) { fprintf(stderr, "usage: fastgit remote <subcommand>\n"); return 1; }
+            const char* sub = cli->cmd_argv[0];
+            if (strcmp(sub, "add") == 0 && cli->cmd_argc >= 3) {
+                fastgit_repository_t* repo = NULL;
+                if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+                // naive: append to .git/config
+                (void)repo;
+                char cfg[1024]; snprintf(cfg, sizeof(cfg), ".git/config");
+                FILE* f = fopen(cfg, "a");
+                if (f) {
+                    fprintf(f, "\n[remote \"%s\"]\n\turl = %s\n\tfetch = +refs/heads/*:refs/remotes/%s/*\n", cli->cmd_argv[1], cli->cmd_argv[2], cli->cmd_argv[1]);
+                    fclose(f);
+                }
+                fastgit_repository_free(repo);
+                return 0;
+            }
+            if (strcmp(sub, "-v") == 0 || strcmp(sub, "get-url") == 0 || strcmp(sub, "show") == 0) {
+                fprintf(stderr, "fastgit remote: use git remote for now\n"); return 1;
+            }
+            fprintf(stderr, "fastgit remote: unknown subcommand %s\n", sub); return 1;
         }
         case FASTGIT_CMD_VERSION: {
             printf("fastgit version %s\n", fastgit_version());

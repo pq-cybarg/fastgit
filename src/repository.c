@@ -383,9 +383,10 @@ static void collect_refs_recursive(const char* base, const char* rel, char*** ou
         if(S_ISDIR(st.st_mode)){
             collect_refs_recursive(base, child_rel, out, count, cap, pattern);
         } else {
-            if(pattern && strstr(child_rel, pattern)==NULL) continue;
+            char refname[4096]; snprintf(refname,sizeof(refname),"refs/%s", child_rel);
+            if(pattern && strstr(refname, pattern)==NULL && strstr(child_rel, pattern)==NULL) continue;
             if(*count>=*cap){ *cap=*cap?*cap*2:32; *out=realloc(*out,*cap*sizeof(char*)); }
-            (*out)[(*count)++]=strdup(child_rel);
+            (*out)[(*count)++]=strdup(refname);
         }
     }
     closedir(d);
@@ -404,13 +405,12 @@ fastgit_error_t fastgit_reference_list(fastgit_repository_t* repo, const char* p
             if(line[0]=='#'||line[0]=='^') continue;
             char ohex[128], rname[256]; if(sscanf(line,"%127s %255s", ohex, rname)!=2) continue;
             if(strncmp(rname,"refs/",5)!=0) continue;
-            const char* rel=rname+5;
-            if(pattern && strstr(rel,pattern)==NULL && strstr(rname,pattern)==NULL) continue;
+            if(pattern && strstr(rname,pattern)==NULL) continue;
             // dedup: check already has file
-            bool dup=false; for(size_t i=0;i<*count;i++) if(strcmp((*out)[i], rel)==0||strcmp((*out)[i], rname)==0) {dup=true;break;}
+            bool dup=false; for(size_t i=0;i<*count;i++) if(strcmp((*out)[i], rname)==0) {dup=true;break;}
             if(dup) continue;
             if(*count>=cap){ cap=cap?cap*2:32; *out=realloc(*out,cap*sizeof(char*)); }
-            (*out)[(*count)++]=strdup(rel);
+            (*out)[(*count)++]=strdup(rname);
         }
         fclose(f);
     }
@@ -464,5 +464,68 @@ fastgit_error_t fastgit_rev_parse(fastgit_repository_t* repo, const char* spec, 
 }
 
 fastgit_error_t fastgit_clone(const char* url, const char* path, const char* ref) {
-    (void)url;(void)path;(void)ref; return FASTGIT_EUNSUPPORTED;
+    if (!url || !path) return FASTGIT_EINVAL;
+    // file:// or local path clone via direct copy + fetch
+    bool is_file = (strncmp(url,"file://",7)==0) || (url[0]=='/' || strncmp(url,"./",2)==0 || strncmp(url,"../",3)==0) || (access(url, F_OK)==0);
+    if (is_file) {
+        const char* src = url;
+        if (strncmp(url,"file://",7)==0) src = url+7;
+        // init destination
+        fastgit_repository_t* dst=NULL;
+        fastgit_error_t er = fastgit_repository_init(path, false, &dst);
+        if (er != FASTGIT_OK) return er;
+        fastgit_repository_free(dst);
+        // reuse fetch logic via temp repo open
+        fastgit_repository_t* repo=NULL;
+        er = fastgit_repository_open(path, &repo);
+        if (er != FASTGIT_OK) return er;
+        // use existing file fetch helpers: directly copy objects/refs
+        // open source repo
+        fastgit_repository_t* src_repo=NULL;
+        // src may be <path>/.git or <path>
+        char src_git[4096];
+        char probe[4096]; snprintf(probe,sizeof(probe),"%s/.git",src);
+        struct stat st; if (stat(probe,&st)==0) snprintf(src_git,sizeof(src_git),"%s",probe);
+        else if (stat(src,&st)==0 && S_ISDIR(st.st_mode)) {
+            // if src is bare (has objects), use as gitdir
+            char o[4096]; snprintf(o,sizeof(o),"%s/objects",src);
+            if (stat(o,&st)==0) snprintf(src_git,sizeof(src_git),"%s",src);
+            else snprintf(src_git,sizeof(src_git),"%s/.git",src);
+        } else snprintf(src_git,sizeof(src_git),"%s",src);
+        // simple copy via fastgit_fetch using file://
+        char file_url[4096]; snprintf(file_url,sizeof(file_url),"file://%s",src);
+        er = fastgit_fetch(repo, file_url, NULL);
+        // checkout HEAD if ref specified or default
+        if (er==FASTGIT_OK) {
+            const char* want = ref ? ref : "HEAD";
+            fastgit_oid_t oid;
+            if (fastgit_rev_parse(repo, want, &oid)==FASTGIT_OK) {
+                // update HEAD and checkout
+                fastgit_worktree_t* wt = fastgit_repository_worktree(repo);
+                // get commit tree
+                fastgit_object_t* obj=NULL;
+                if (fastgit_object_lookup(repo,&oid,&obj)==FASTGIT_OK) {
+                    fastgit_oid_t tree_oid = oid;
+                    if (fastgit_object_type(obj)==FASTGIT_OBJ_COMMIT) {
+                        const fastgit_commit_t* c = fastgit_commit_parse(obj);
+                        if (c) tree_oid = c->tree;
+                    }
+                    fastgit_object_free(obj);
+                    // checkout tree and update index
+                    fastgit_index_t* idx = fastgit_repository_index(repo);
+                    if (idx) {
+                        fastgit_index_read_tree(idx, &tree_oid);
+                        fastgit_index_write(idx);
+                    }
+                    if (wt) {
+                        fastgit_checkout_tree(wt, &tree_oid, true);
+                    }
+                }
+            }
+        }
+        fastgit_repository_free(repo);
+        (void)src_git;
+        return er;
+    }
+    return FASTGIT_EUNSUPPORTED;
 }
