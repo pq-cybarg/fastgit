@@ -37,7 +37,14 @@ static int index_entry_cmp(const void* a, const void* b) {
     return (int)ea->stage - (int)eb->stage;
 }
 
-static void index_entry_from_disk(const fastgit_index_entry_disk_t* disk, fastgit_index_entry_t* entry) {
+static uint8_t index_algo_from_len(size_t len) {
+    if (len == 20) return FASTGIT_HASH_SHA1;
+    if (len == 32) return FASTGIT_HASH_SHA256;
+    if (len == 48) return FASTGIT_HASH_SHA384;
+    if (len == 64) return FASTGIT_HASH_SHA3_512;
+    return FASTGIT_HASH_SHA256;
+}
+static void index_entry_from_disk(const fastgit_index_entry_disk_t* disk, fastgit_index_entry_t* entry, uint8_t algo, size_t oid_len) {
     entry->ctime_sec = __builtin_bswap32(disk->ctime_sec);
     entry->ctime_nsec = __builtin_bswap32(disk->ctime_nsec);
     entry->mtime_sec = __builtin_bswap32(disk->mtime_sec);
@@ -48,13 +55,15 @@ static void index_entry_from_disk(const fastgit_index_entry_disk_t* disk, fastgi
     entry->uid = __builtin_bswap32(disk->uid);
     entry->gid = __builtin_bswap32(disk->gid);
     entry->size = __builtin_bswap32(disk->size);
-    entry->flags = __builtin_bswap16(disk->flags);
+    // disk->oid is at offset 40; flags follows oid_len
+    entry->flags = 0;
     entry->flags_extended = 0;
-    entry->stage = (entry->flags >> 12) & 0x3;
-    entry->oid.algo = FASTGIT_HASH_SHA256;
-    entry->oid.len = 32;
-    memcpy(entry->oid.hash, disk->oid, 32);
+    entry->stage = 0;
+    entry->oid.algo = algo;
+    entry->oid.len = oid_len;
+    memcpy(entry->oid.hash, disk->oid, oid_len);
     entry->path = NULL;
+    // flags will be set by caller after reading variable oid
 }
 
 static void index_entry_to_disk(const fastgit_index_entry_t* entry, fastgit_index_entry_disk_t* disk) {
@@ -68,8 +77,8 @@ static void index_entry_to_disk(const fastgit_index_entry_t* entry, fastgit_inde
     disk->uid = __builtin_bswap32(entry->uid);
     disk->gid = __builtin_bswap32(entry->gid);
     disk->size = __builtin_bswap32(entry->size);
-    memcpy(disk->oid, entry->oid.hash, 32);
-    disk->flags = __builtin_bswap16(entry->flags);
+    memcpy(disk->oid, entry->oid.hash, entry->oid.len > 64 ? 64 : entry->oid.len);
+    // flags set by caller
 }
 
 __attribute__((unused)) static void index_entry_free(fastgit_index_entry_t* entry) {
@@ -104,6 +113,8 @@ fastgit_error_t fastgit_index_new(fastgit_index_t** out) {
     index->vfs.opendir = opendir;
     index->vfs.readdir = readdir;
     index->vfs.closedir = closedir;
+    index->oid_algo = FASTGIT_HASH_SHA256;
+    index->oid_len = 32;
     index->sorted = true;
 
     *out = index;
@@ -233,15 +244,35 @@ fastgit_error_t fastgit_index_read(fastgit_index_t* index, const char* path) {
             index->entries = new_entries;
         }
 
+        // oid_len agility: detect from file size if ambiguous; default to index->oid_len (32) else infer from remaining
+        // For now use stored oid_len (32) but compute fixed size as 40+oid_len+2
+        if (index->oid_len == 0) { index->oid_len = 32; index->oid_algo = FASTGIT_HASH_SHA256; }
+        size_t fixed_sz = 40 + index->oid_len + 2;
         for (uint32_t i = 0; i < header.count; i++) {
-            if (ptr + sizeof(fastgit_index_entry_disk_t) > end) break;
+            if (ptr + fixed_sz > end) break;
 
             fastgit_index_entry_disk_t disk_entry;
-            memcpy(&disk_entry, ptr, sizeof(fastgit_index_entry_disk_t));
-            ptr += sizeof(fastgit_index_entry_disk_t);
+            // parse fixed fields manually to support variable oid_len
+            uint32_t tmp;
+            memcpy(&tmp, ptr, 4); disk_entry.ctime_sec = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.ctime_nsec = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.mtime_sec = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.mtime_nsec = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.dev = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.ino = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.mode = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.uid = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.gid = tmp; ptr += 4;
+            memcpy(&tmp, ptr, 4); disk_entry.size = tmp; ptr += 4;
+            memcpy(disk_entry.oid, ptr, index->oid_len); ptr += index->oid_len;
+            uint16_t fl; memcpy(&fl, ptr, 2); disk_entry.flags = fl; ptr += 2;
 
             fastgit_index_entry_t* entry = &index->entries[index->count++];
-            index_entry_from_disk(&disk_entry, entry);
+            index_entry_from_disk(&disk_entry, entry, index->oid_algo, index->oid_len);
+            // flags path len is in entry->flags (bswapped later)
+            uint16_t be_flags = __builtin_bswap16(disk_entry.flags);
+            entry->flags = be_flags;
+            entry->stage = (be_flags >> 12) & 0x3;
             const char* path_start = (const char*)ptr;
             entry->path = strdup(path_start ? path_start : "");
             if (!entry->path) {
@@ -249,18 +280,16 @@ fastgit_error_t fastgit_index_read(fastgit_index_t* index, const char* path) {
                 close(fd);
                 return FASTGIT_ENOMEM;
             }
-            size_t path_len = entry->flags & 0x0FFF;
-            size_t entry_len;
-            if (path_len == 0x0FFF) {
-                size_t actual = 0;
+            size_t path_len_flag = be_flags & 0x0FFF;
+            size_t actual;
+            if (path_len_flag == 0x0FFF) {
+                actual = 0;
                 while (ptr + actual < end && ptr[actual]) actual++;
-                entry_len = sizeof(fastgit_index_entry_disk_t) + actual + 1;
-                ptr += actual + 1;
             } else {
-                size_t actual = strlen(path_start);
-                entry_len = sizeof(fastgit_index_entry_disk_t) + actual + 1;
-                ptr += actual + 1;
+                actual = strlen(path_start);
             }
+            size_t entry_len = fixed_sz + actual + 1;
+            ptr += actual + 1;
             size_t pad = (8 - (entry_len % 8)) % 8;
             ptr += pad;
         }
@@ -291,13 +320,15 @@ fastgit_error_t fastgit_index_write_to(fastgit_index_t* index, const char* path)
     }
     index->sorted = true;
 
+    if (index->oid_len == 0) { index->oid_len = 32; index->oid_algo = FASTGIT_HASH_SHA256; }
+    size_t fixed_sz = 40 + index->oid_len + 2;
     size_t total_size = sizeof(fastgit_index_header_t);
     for (size_t i = 0; i < index->count; i++) {
-        size_t entry_len = sizeof(fastgit_index_entry_disk_t) + strlen(index->entries[i].path) + 1;
+        size_t entry_len = fixed_sz + strlen(index->entries[i].path) + 1;
         size_t pad = (8 - (entry_len % 8)) % 8;
         total_size += entry_len + pad;
     }
-    total_size += 32;
+    total_size += index->oid_len;
 
     void* buf = malloc(total_size);
     if (!buf) return FASTGIT_ENOMEM;
@@ -313,22 +344,38 @@ fastgit_error_t fastgit_index_write_to(fastgit_index_t* index, const char* path)
     ptr += sizeof(fastgit_index_header_t);
 
     for (size_t i = 0; i < index->count; i++) {
-        fastgit_index_entry_disk_t disk_entry;
-        index_entry_to_disk(&index->entries[i], &disk_entry);
-        memcpy(ptr, &disk_entry, sizeof(fastgit_index_entry_disk_t));
-        ptr += sizeof(fastgit_index_entry_disk_t);
+        fastgit_index_entry_t* e = &index->entries[i];
+        // write fixed fields with oid_len agility
+        uint32_t be32;
+        be32 = __builtin_bswap32(e->ctime_sec); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->ctime_nsec); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->mtime_sec); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->mtime_nsec); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->dev); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->ino); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->mode); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->uid); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->gid); memcpy(ptr, &be32, 4); ptr+=4;
+        be32 = __builtin_bswap32(e->size); memcpy(ptr, &be32, 4); ptr+=4;
+        memcpy(ptr, e->oid.hash, index->oid_len > e->oid.len ? e->oid.len : index->oid_len);
+        if (index->oid_len > e->oid.len) memset(ptr + e->oid.len, 0, index->oid_len - e->oid.len);
+        ptr += index->oid_len;
+        uint16_t raw = e->flags;
+        if (raw == 0) raw = (uint16_t)(strlen(e->path) & 0x0FFF) | ((uint16_t)e->stage << 12);
+        uint16_t be16 = __builtin_bswap16(raw);
+        memcpy(ptr, &be16, 2); ptr+=2;
 
-        size_t path_len = strlen(index->entries[i].path);
-        memcpy(ptr, index->entries[i].path, path_len + 1);
+        size_t path_len = strlen(e->path);
+        memcpy(ptr, e->path, path_len + 1);
         ptr += path_len + 1;
 
-        size_t entry_len = sizeof(fastgit_index_entry_disk_t) + path_len + 1;
+        size_t entry_len = fixed_sz + path_len + 1;
         size_t pad = (8 - (entry_len % 8)) % 8;
         for (size_t p = 0; p < pad; p++) *ptr++ = 0;
     }
 
-    fastgit_hash(FASTGIT_HASH_SHA256, buf, ptr - (uint8_t*)buf, &index->checksum);
-    memcpy(ptr, index->checksum.digest, 32);
+    fastgit_hash(index->oid_algo, buf, ptr - (uint8_t*)buf, &index->checksum);
+    memcpy(ptr, index->checksum.digest, index->checksum.len ? index->checksum.len : index->oid_len);
 
     int fd = index->vfs.open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {

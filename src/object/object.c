@@ -183,7 +183,14 @@ fastgit_error_t fastgit_oid_from_hex(const char* hex, fastgit_oid_t* out) {
 
     out->len = hex_len / 2;
     if (out->len > FASTGIT_HASH_MAX_DIGEST) return FASTGIT_EOVERFLOW;
-    out->algo = FASTGIT_HASH_SHA256;
+    /* hash agility: infer algo from hex length */
+    if (out->len == 20) out->algo = FASTGIT_HASH_SHA1;
+    else if (out->len == 32) {
+        /* could be SHA256 or SHA3-256; default SHA256 (length-extension resistant SHA3 preferred explicitly) */
+        out->algo = FASTGIT_HASH_SHA256;
+    } else if (out->len == 48) out->algo = FASTGIT_HASH_SHA384;
+    else if (out->len == 64) out->algo = FASTGIT_HASH_SHA3_512;
+    else out->algo = FASTGIT_HASH_SHA256;
 
     for (size_t i = 0; i < out->len; i++) {
         char high = hex[i * 2];

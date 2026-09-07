@@ -11,6 +11,7 @@
 extern "C" {
 #endif
 
+#define FASTGIT_HASH_SHA1 0x00
 #define FASTGIT_HASH_SHA256 0x01
 #define FASTGIT_HASH_SHA384 0x02
 #define FASTGIT_HASH_SHA3_256 0x03

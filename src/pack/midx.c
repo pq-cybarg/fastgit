@@ -32,8 +32,11 @@ struct fastgit_midx {
 };
 
 typedef struct { fastgit_oid_t oid; uint8_t pack_idx; uint64_t offset; } midx_entry_t;
+static size_t midx_oid_len = 32;
 static int midx_entry_cmp(const void* a, const void* b) {
-    return memcmp(((const midx_entry_t*)a)->oid.hash, ((const midx_entry_t*)b)->oid.hash, 32);
+    size_t hl = midx_oid_len;
+    if (((const midx_entry_t*)a)->oid.len) hl = ((const midx_entry_t*)a)->oid.len;
+    return memcmp(((const midx_entry_t*)a)->oid.hash, ((const midx_entry_t*)b)->oid.hash, hl);
 }
 
 fastgit_error_t fastgit_midx_create(const char* midx_file, const char** pack_dirs, size_t dir_count) {
@@ -81,6 +84,8 @@ fastgit_error_t fastgit_midx_create(const char* midx_file, const char** pack_dir
         pack_idx++;
     }
     if (count == 0) { free(entries); return FASTGIT_ENOENT; }
+    size_t oid_len = entries[0].oid.len ? entries[0].oid.len : 32;
+    midx_oid_len = oid_len;
     qsort(entries, count, sizeof(midx_entry_t), midx_entry_cmp);
     // fanout cumulative
     uint32_t fanout[256] = {0};
@@ -95,11 +100,11 @@ fastgit_error_t fastgit_midx_create(const char* midx_file, const char** pack_dir
     if (write(fd, &sig, 4) != 4 || write(fd, &ver, 4) != 4 || write(fd, &pc, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; }
     for (size_t i = 0; i < pack_count; i++) { uint32_t pid = __builtin_bswap32((uint32_t)i); if (write(fd, &pid, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
     for (int i = 0; i < 256; i++) { uint32_t v = __builtin_bswap32(fanout[i]); if (write(fd, &v, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
-    for (size_t i = 0; i < count; i++) if (write(fd, entries[i].oid.hash, 32) != 32) { close(fd); free(entries); return FASTGIT_EIO; }
+    for (size_t i = 0; i < count; i++) if (write(fd, entries[i].oid.hash, (int)oid_len) != (int)oid_len) { close(fd); free(entries); return FASTGIT_EIO; }
     for (size_t i = 0; i < count; i++) { uint8_t p = entries[i].pack_idx; if (write(fd, &p, 1) != 1) { close(fd); free(entries); return FASTGIT_EIO; } }
     for (size_t i = 0; i < count; i++) { uint32_t off = __builtin_bswap32((uint32_t)entries[i].offset); if (write(fd, &off, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
-    uint8_t checksum[32] = {0};
-    if (write(fd, checksum, 32) != 32) { close(fd); free(entries); return FASTGIT_EIO; }
+    uint8_t checksum[64] = {0};
+    if (write(fd, checksum, (int)oid_len) != (int)oid_len) { close(fd); free(entries); return FASTGIT_EIO; }
     close(fd);
     free(entries);
     return FASTGIT_OK;
@@ -199,16 +204,32 @@ fastgit_error_t fastgit_midx_open(const char* midx_file, fastgit_midx_t** out) {
         if (i == 255) midx->object_count = count;
     }
 
+    size_t midx_hash_len = 32;
+    {
+        size_t hdr = 12 + (size_t)midx->pack_count * 4 + 1024;
+        if (midx->mapped_size >= hdr) {
+            size_t rem = midx->mapped_size - hdr;
+            size_t cnt = midx->object_count;
+            if (cnt) {
+                size_t cand = (rem > cnt * 5) ? (rem - cnt * 5) / (cnt + 1) : 32;
+                if (cand == 20 || cand == 32 || cand == 48 || cand == 64) midx_hash_len = cand;
+                else if (cand > 48) midx_hash_len = 64;
+                else if (cand > 32) midx_hash_len = 48;
+                else if (cand > 20) midx_hash_len = 32;
+                else midx_hash_len = 20;
+            }
+        }
+    }
     midx->oids = malloc(midx->object_count * sizeof(fastgit_oid_t));
     if (!midx->oids) {
         fastgit_midx_free(midx);
         return FASTGIT_ENOMEM;
     }
     for (uint32_t i = 0; i < midx->object_count; i++) {
-        midx->oids[i].algo = FASTGIT_HASH_SHA256;
-        midx->oids[i].len = 32;
-        memcpy(midx->oids[i].hash, ptr, 32);
-        ptr += 32;
+        midx->oids[i].algo = (midx_hash_len == 20) ? FASTGIT_HASH_SHA1 : (midx_hash_len == 48) ? FASTGIT_HASH_SHA384 : (midx_hash_len == 64) ? FASTGIT_HASH_SHA3_512 : FASTGIT_HASH_SHA256;
+        midx->oids[i].len = midx_hash_len;
+        memcpy(midx->oids[i].hash, ptr, midx_hash_len);
+        ptr += midx_hash_len;
     }
 
     midx->pack_indices = malloc(midx->object_count * sizeof(uint32_t));
@@ -231,10 +252,13 @@ fastgit_error_t fastgit_midx_open(const char* midx_file, fastgit_midx_t** out) {
         ptr += 4;
     }
 
-    if ((size_t)midx->mapped_size >= (size_t)((ptr - (uint8_t*)midx->mapped) + 32)) {
-        midx->checksum.algo = FASTGIT_HASH_SHA256;
-        midx->checksum.len = 32;
-        memcpy(midx->checksum.digest, ptr, 32);
+    {
+        size_t hl = midx->object_count ? midx->oids[0].len : 32;
+        if ((size_t)midx->mapped_size >= (size_t)((ptr - (uint8_t*)midx->mapped) + (int)hl)) {
+            midx->checksum.algo = (hl == 20) ? FASTGIT_HASH_SHA1 : (hl == 48) ? FASTGIT_HASH_SHA384 : (hl == 64) ? FASTGIT_HASH_SHA3_512 : FASTGIT_HASH_SHA256;
+            midx->checksum.len = hl;
+            memcpy(midx->checksum.digest, ptr, hl);
+        }
     }
 
     *out = midx;
@@ -261,7 +285,7 @@ void fastgit_midx_free(fastgit_midx_t* midx) {
 
 fastgit_error_t fastgit_midx_find(fastgit_midx_t* midx, const fastgit_oid_t* oid, fastgit_pack_t** pack_out, uint32_t* index_out) {
     if (!midx || !oid || !pack_out || !index_out) return FASTGIT_EINVAL;
-    if (oid->len != 32) return FASTGIT_ENOENT;
+    if (midx->object_count && oid->len != midx->oids[0].len) return FASTGIT_ENOENT;
 
     uint32_t first = oid->hash[0];
     uint8_t* fanout = (uint8_t*)midx->mapped + 12 + midx->pack_count * 4;
@@ -270,7 +294,8 @@ fastgit_error_t fastgit_midx_find(fastgit_midx_t* midx, const fastgit_oid_t* oid
 
     while (lo < hi) {
         uint32_t mid = (lo + hi) / 2;
-        int cmp = memcmp(midx->oids[mid].hash, oid->hash, 32);
+        size_t hl = midx->oids[mid].len ? midx->oids[mid].len : oid->len;
+        int cmp = memcmp(midx->oids[mid].hash, oid->hash, hl);
         if (cmp < 0) lo = mid + 1;
         else if (cmp > 0) hi = mid;
         else {

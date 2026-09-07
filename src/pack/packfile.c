@@ -422,21 +422,18 @@ fastgit_error_t fastgit_pack_index_load(const char* idx_file,fastgit_pack_index_
     ptr+=8;
     for(int i=0;i<256;i++){ idx->data.fanout[i]=__builtin_bswap32(*(uint32_t*)ptr); ptr+=4; }
     idx->data.count=idx->data.fanout[255];
-    // detect hash len: try 32, then 20
+    // detect hash len: try 20/32/48/64
     size_t hash_len=32;
-    // compute expected size for 32
-    size_t expect32=8+1024 + (size_t)idx->data.count*hash_len + (size_t)idx->data.count*4 + (size_t)idx->data.count*4 + 2*hash_len;
-    size_t expect20=8+1024 + (size_t)idx->data.count*20 + (size_t)idx->data.count*4 + (size_t)idx->data.count*4 + 2*20;
-    // large offset handling: if any offset has MSB set, need extra 8 bytes per large entry; approximate by checking file size
-    // Try to deduce: if file_size == expect32 or expect32 + k*8, use 32 else 20
-    if(idx->mapped_size!=expect32 && idx->mapped_size!=expect32+8 && idx->mapped_size!=expect32+16){
-        // check if 20 fits
-        if(idx->mapped_size==expect20 || idx->mapped_size==expect20+8) hash_len=20;
-        else {
-            // fallback: if count small, prefer 32 for sha256 repos
-            // keep 32
+    size_t cand_lens[4]={20,32,48,64};
+    size_t best=32; bool matched=false;
+    for(int ci=0;ci<4;ci++){
+        size_t hl=cand_lens[ci];
+        size_t base=8+1024 + (size_t)idx->data.count*hl + (size_t)idx->data.count*4 + (size_t)idx->data.count*4 + 2*hl;
+        if(idx->mapped_size==base || (idx->mapped_size>base && (idx->mapped_size-base)%8==0 && idx->mapped_size-base<= (size_t)idx->data.count*8)){
+            best=hl; matched=true; break;
         }
     }
+    if(matched) hash_len=best;
     // refine by checking remaining
     // Re-estimate with hash_len
     idx->data.oids=malloc(idx->data.count*sizeof(fastgit_oid_t)); if(!idx->data.oids){ fastgit_pack_index_free(idx); return FASTGIT_ENOMEM; }
@@ -474,12 +471,13 @@ fastgit_error_t fastgit_pack_index_create(const char* idx_file, fastgit_pack_t* 
     if(!pack->writing) return FASTGIT_EINVAL;
     // sort indices by oid
     uint32_t n=pack->w_count;
+    size_t oid_len = n ? pack->w_oids[0].len : 32;
     uint32_t* order=malloc(n*sizeof(uint32_t)); if(!order) return FASTGIT_ENOMEM;
     for(uint32_t i=0;i<n;i++) order[i]=i;
     // simple insertion sort (n small) else qsort
     for(uint32_t i=1;i<n;i++){
         uint32_t key=order[i]; int j=i-1;
-        while(j>=0 && memcmp(pack->w_oids[order[j]].hash, pack->w_oids[key].hash, 32)>0){ order[j+1]=order[j]; j--; }
+        while(j>=0 && memcmp(pack->w_oids[order[j]].hash, pack->w_oids[key].hash, oid_len)>0){ order[j+1]=order[j]; j--; }
         order[j+1]=key;
     }
     // build fanout
@@ -494,14 +492,14 @@ fastgit_error_t fastgit_pack_index_create(const char* idx_file, fastgit_pack_t* 
     uint8_t hdr[8]={0xFF,0x74,0x4F,0x63,0x00,0x00,0x00,0x02};
     write(fd,hdr,8);
     for(int i=0;i<256;i++){ uint32_t v=__builtin_bswap32(fanout[i]); write(fd,&v,4); }
-    for(uint32_t i=0;i<n;i++) write(fd,pack->w_oids[order[i]].hash,32);
+    for(uint32_t i=0;i<n;i++) write(fd,pack->w_oids[order[i]].hash,oid_len);
     for(uint32_t i=0;i<n;i++){ uint32_t c=__builtin_bswap32(pack->w_crcs[order[i]]); write(fd,&c,4); }
     // offsets need 32-bit unless >2GB; we store 32 for now
     for(uint32_t i=0;i<n;i++){ uint32_t off=(uint32_t)pack->w_offsets[order[i]]; uint32_t be=__builtin_bswap32(off); write(fd,&be,4); }
     // pack checksum (re-read from pack tail)
     {
         int pfd=open(pack->pack_file,O_RDONLY); if(pfd>=0){ struct stat st; fstat(pfd,&st);
-            size_t sz=(size_t)st.st_size; if(sz>=32){ lseek(pfd, sz-32, SEEK_SET); uint8_t cs[32]; read(pfd,cs,32); write(fd,cs,32); } else { uint8_t z[32]={0}; write(fd,z,32); }
+            size_t sz=(size_t)st.st_size; if(sz>=32){ lseek(pfd, sz-32, SEEK_SET); uint8_t cs[32]; read(pfd,cs,32); write(fd,cs,32); }         else { uint8_t z[64]={0}; write(fd,z,oid_len); }
             close(pfd);
         }
     }

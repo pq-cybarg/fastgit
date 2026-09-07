@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 set(FASTGIT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hash/hash.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/hash/sha1.c
     ${CMAKE_CURRENT_SOURCE_DIR}/hash/sha256.c
     ${CMAKE_CURRENT_SOURCE_DIR}/hash/sha384.c
     ${CMAKE_CURRENT_SOURCE_DIR}/hash/sha3.c

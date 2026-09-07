@@ -166,9 +166,16 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
 
     switch (cli->cmd) {
         case FASTGIT_CMD_INIT: {
-            const char* path = cli->cmd_argc > 0 ? cli->cmd_argv[0] : ".";
+            const char* path = ".";
+            bool bare = false;
+            for(int i=0;i<cli->cmd_argc;i++){
+                if(strcmp(cli->cmd_argv[i],"-q")==0 || strcmp(cli->cmd_argv[i],"--quiet")==0) continue;
+                else if(strcmp(cli->cmd_argv[i],"--bare")==0) bare=true;
+                else if(cli->cmd_argv[i][0]=='-') continue;
+                else { path=cli->cmd_argv[i]; break; }
+            }
             fastgit_repository_t* repo;
-            fastgit_error_t err = fastgit_repository_init(path, false, &repo);
+            fastgit_error_t err = fastgit_repository_init(path, bare, &repo);
             if (err != FASTGIT_OK) {
                 fprintf(stderr, "fatal: could not create repository: %s\n", fastgit_error_string(err));
                 return 1;
@@ -554,15 +561,71 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
         }
         case FASTGIT_CMD_LS_TREE: {
             if (cli->cmd_argc<1){fprintf(stderr,"usage: fastgit ls-tree <tree-ish>\n");return 1;}
+            bool recursive=false; const char* treeish=NULL;
+            for(int i=0;i<cli->cmd_argc;i++){
+                if(strcmp(cli->cmd_argv[i],"-r")==0 || strcmp(cli->cmd_argv[i],"--recursive")==0) recursive=true;
+                else if(cli->cmd_argv[i][0]!='-' && !treeish) treeish=cli->cmd_argv[i];
+                else if(cli->cmd_argv[i][0]!='-' && treeish) { /* ignore extra pathspec for now */ }
+            }
+            if(!treeish) treeish=cli->cmd_argv[cli->cmd_argc-1];
             fastgit_repository_t* repo=NULL;
             if (fastgit_repository_open(".", &repo)!=FASTGIT_OK){fprintf(stderr,"fatal: not a git repository\n");return 1;}
-            fastgit_oid_t oid; if(fastgit_rev_parse(repo,cli->cmd_argv[0],&oid)!=FASTGIT_OK){fprintf(stderr,"fatal: bad tree %s\n",cli->cmd_argv[0]);fastgit_repository_free(repo);return 1;}
+            fastgit_oid_t oid; if(fastgit_rev_parse(repo,treeish,&oid)!=FASTGIT_OK){fprintf(stderr,"fatal: bad tree %s\n",treeish);fastgit_repository_free(repo);return 1;}
             fastgit_object_t* obj=NULL; if(fastgit_object_lookup(repo,&oid,&obj)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}
             fastgit_obj_type_t t=fastgit_object_type(obj);
             if(t==FASTGIT_OBJ_COMMIT){ const fastgit_commit_t* c=fastgit_commit_parse(obj); if(c) oid=c->tree; fastgit_object_free(obj); if(fastgit_object_lookup(repo,&oid,&obj)!=FASTGIT_OK){fastgit_repository_free(repo);return 1;}}
-            size_t cnt=fastgit_tree_entry_count(obj);
-            for(size_t i=0;i<cnt;i++){ const fastgit_tree_entry_t* e=fastgit_tree_entry_by_index(obj,i); char hex[129]; fastgit_oid_to_hex(&e->oid,hex,sizeof(hex)); const char* tname = (e->mode == 040000 || (e->mode & 0170000) == 0040000) ? fastgit_obj_type_name(FASTGIT_OBJ_TREE) : fastgit_obj_type_name(FASTGIT_OBJ_BLOB); printf("%06o %s %s\t%s\n", e->mode, tname, hex, e->path); }
-            fastgit_object_free(obj); fastgit_repository_free(repo); return 0;
+            if(!recursive){
+                size_t cnt=fastgit_tree_entry_count(obj);
+                for(size_t i=0;i<cnt;i++){ const fastgit_tree_entry_t* e=fastgit_tree_entry_by_index(obj,i); char hex[129]; fastgit_oid_to_hex(&e->oid,hex,sizeof(hex)); const char* tname = (e->mode == 040000 || (e->mode & 0170000) == 0040000) ? fastgit_obj_type_name(FASTGIT_OBJ_TREE) : fastgit_obj_type_name(FASTGIT_OBJ_BLOB); printf("%06o %s %s\t%s\n", e->mode, tname, hex, e->path); }
+                fastgit_object_free(obj); fastgit_repository_free(repo); return 0;
+            }
+            // recursive: depth-first walk
+            typedef struct { fastgit_oid_t oid; char prefix[1024]; } ls_stack_t;
+            ls_stack_t stack[256]; int sp=0;
+            stack[sp].oid=oid; stack[sp].prefix[0]='\0'; sp++;
+            // we already have obj for root; reuse it
+            // iterative DFS using stack of OIDs
+            // handle root first then push subtrees
+            // to avoid recursion limit, use explicit stack
+            // For simplicity, process root object already loaded, then push children
+            // We'll use a dynamic list of pending trees
+            struct pending { fastgit_oid_t oid; char prefix[1024]; struct pending* next; } *pending=NULL;
+            // print root entries and queue subtrees
+            size_t rcnt=fastgit_tree_entry_count(obj);
+            for(size_t i=0;i<rcnt;i++){
+                const fastgit_tree_entry_t* e=fastgit_tree_entry_by_index(obj,i);
+                bool is_tree = (e->mode == 040000 || (e->mode & 0170000) == 0040000);
+                if (!is_tree) {
+                    char hex[129]; fastgit_oid_to_hex(&e->oid,hex,sizeof(hex));
+                    printf("%06o %s %s\t%s\n", e->mode, fastgit_obj_type_name(FASTGIT_OBJ_BLOB), hex, e->path);
+                }
+                if(is_tree){
+                    char full[2048]; if(stack[0].prefix[0]) snprintf(full,sizeof(full),"%s/%s",stack[0].prefix,e->path); else snprintf(full,sizeof(full),"%s",e->path);
+                    struct pending* p=malloc(sizeof(*p)); p->oid=e->oid; snprintf(p->prefix,sizeof(p->prefix),"%s",full); p->next=pending; pending=p;
+                }
+            }
+            fastgit_object_free(obj);
+            while(pending){
+                struct pending* cur=pending; pending=pending->next;
+                fastgit_object_t* tobj=NULL;
+                if(fastgit_object_lookup(repo,&cur->oid,&tobj)!=FASTGIT_OK){ free(cur); continue; }
+                size_t ccnt=fastgit_tree_entry_count(tobj);
+                for(size_t i=0;i<ccnt;i++){
+                    const fastgit_tree_entry_t* e=fastgit_tree_entry_by_index(tobj,i);
+                    bool is_tree = (e->mode == 040000 || (e->mode & 0170000) == 0040000);
+                    if (!is_tree) {
+                        char hex[129]; fastgit_oid_to_hex(&e->oid,hex,sizeof(hex));
+                        char full[2048]; snprintf(full,sizeof(full),"%s/%s",cur->prefix,e->path);
+                        printf("%06o %s %s\t%s\n", e->mode, fastgit_obj_type_name(FASTGIT_OBJ_BLOB), hex, full);
+                    }
+                    if(is_tree){
+                        char full[2048]; snprintf(full,sizeof(full),"%s/%s",cur->prefix,e->path);
+                        struct pending* p=malloc(sizeof(*p)); p->oid=e->oid; snprintf(p->prefix,sizeof(p->prefix),"%s",full); p->next=pending; pending=p;
+                    }
+                }
+                fastgit_object_free(tobj); free(cur);
+            }
+            fastgit_repository_free(repo); return 0;
         }
         case FASTGIT_CMD_WRITE_TREE: {
             fastgit_repository_t* repo=NULL;

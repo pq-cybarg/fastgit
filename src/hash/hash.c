@@ -1,9 +1,13 @@
 #include "fastgit/hash.h"
+#include "sha1.h"
 #include "sha256.h"
 #include "sha384.h"
 #include "sha3.h"
 #include <stdlib.h>
 #include <string.h>
+#if defined(FASTGIT_HAVE_OPENSSL) && FASTGIT_HAVE_OPENSSL
+#include <openssl/evp.h>
+#endif
 
 struct fastgit_hash_ctx {
     const fastgit_hash_vtable_t* vtable;
@@ -28,6 +32,36 @@ bool fastgit_hash_is_supported(uint8_t algo) {
 
 fastgit_error_t fastgit_hash(uint8_t algo, const void* data, size_t len, fastgit_hash_t* out) {
     if (!out) return FASTGIT_EINVAL;
+#if defined(FASTGIT_HAVE_OPENSSL) && FASTGIT_HAVE_OPENSSL
+    if (algo == FASTGIT_HASH_SHA256) {
+        static __thread EVP_MD_CTX* tls = NULL;
+        if (!tls) tls = EVP_MD_CTX_new();
+        if (tls) {
+            unsigned int olen = 32;
+            if (EVP_DigestInit_ex(tls, EVP_sha256(), NULL) == 1 &&
+                EVP_DigestUpdate(tls, data, len) == 1 &&
+                EVP_DigestFinal_ex(tls, out->digest, &olen) == 1) {
+                out->algo = algo;
+                out->len = 32;
+                return FASTGIT_OK;
+            }
+        }
+    }
+    if (algo == FASTGIT_HASH_SHA384) {
+        static __thread EVP_MD_CTX* tls384 = NULL;
+        if (!tls384) tls384 = EVP_MD_CTX_new();
+        if (tls384) {
+            unsigned int olen = 48;
+            if (EVP_DigestInit_ex(tls384, EVP_sha384(), NULL) == 1 &&
+                EVP_DigestUpdate(tls384, data, len) == 1 &&
+                EVP_DigestFinal_ex(tls384, out->digest, &olen) == 1) {
+                out->algo = algo;
+                out->len = 48;
+                return FASTGIT_OK;
+            }
+        }
+    }
+#endif
     const fastgit_hash_vtable_t* vtable = fastgit_hash_get_vtable(algo);
     if (!vtable) return FASTGIT_EUNSUPPORTED;
 
@@ -218,6 +252,7 @@ size_t fastgit_hash_algo_block_size(uint8_t algo) {
 
 __attribute__((constructor))
 static void fastgit_hash_register_all(void) {
+    fastgit_hash_register(fastgit_sha1_vtable());
     fastgit_hash_register(fastgit_sha256_vtable());
     fastgit_hash_register(fastgit_sha384_vtable());
     fastgit_hash_register(fastgit_sha3_256_vtable());

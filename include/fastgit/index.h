@@ -38,7 +38,7 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     uint32_t size;
-    uint8_t oid[32];
+    uint8_t oid[64];
     uint16_t flags;
 } fastgit_index_entry_disk_t;
 #pragma pack(pop)
@@ -86,6 +86,8 @@ struct fastgit_index {
     size_t capacity;
     bool dirty;
     bool sorted;
+    uint8_t oid_algo;
+    size_t oid_len;
     fastgit_index_vfs_t vfs;
     fastgit_hash_t checksum;
     uint64_t mtime;
