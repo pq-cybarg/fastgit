@@ -35,7 +35,7 @@ int main(void) {
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     double compress_ms = time_diff(start, end);
-    printf("Compress: %8.2f ms  %10.0f ops/s\n", compress_ms, ITERATIONS / (compress_ms / 1000.0));
+    printf("Delta compress: %8.2f ms  %10.0f ops/s  (hash-table, 32 probes)\n", compress_ms, ITERATIONS / (compress_ms / 1000.0));
 
     void* delta;
     size_t delta_len;

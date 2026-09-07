@@ -68,19 +68,43 @@ fastgit_error_t fastgit_delta_compress(const void* base, size_t base_len, const 
     size_t tpos = 0;
     uint8_t lit_buf[127];
     size_t lit_len = 0;
+    // hash table for 4-byte sequences in base: 14-bit = 16k buckets, chain via next[]
+    const size_t HT_BITS = 14;
+    const size_t HT_SIZE = (size_t)1 << HT_BITS;
+    int* head = NULL;
+    int* nxt = NULL;
+    if (b && base_len >= 4) {
+        head = (int*)malloc(HT_SIZE * sizeof(int));
+        nxt = (int*)malloc(base_len * sizeof(int));
+        if (head && nxt) {
+            for (size_t i = 0; i < HT_SIZE; i++) head[i] = -1;
+            for (size_t i = 0; i + 4 <= base_len; i++) {
+                uint32_t h = ((uint32_t)b[i] << 24) | ((uint32_t)b[i+1] << 16) | ((uint32_t)b[i+2] << 8) | (uint32_t)b[i+3];
+                h = (h * 2654435761u) >> (32 - HT_BITS);
+                nxt[i] = head[h];
+                head[h] = (int)i;
+            }
+        } else {
+            free(head); free(nxt); head = NULL; nxt = NULL;
+        }
+    }
     while (tpos < target_len) {
         size_t best_len = 0;
         size_t best_off = 0;
-        if (b && base_len >= 4 && target_len - tpos >= 4) {
-            for (size_t boff = 0; boff + 4 <= base_len; boff++) {
-                if (b[boff] != t[tpos]) continue;
-                size_t ml = 0;
-                size_t max_ml = base_len - boff;
+        if (b && base_len >= 4 && target_len - tpos >= 4 && head && nxt) {
+            uint32_t h = ((uint32_t)t[tpos] << 24) | ((uint32_t)t[tpos+1] << 16) | ((uint32_t)t[tpos+2] << 8) | (uint32_t)t[tpos+3];
+            h = (h * 2654435761u) >> (32 - HT_BITS);
+            int visits = 0;
+            for (int boff = head[h]; boff != -1 && visits < 32; boff = nxt[boff], visits++) {
+                if ((size_t)boff + 4 > base_len) continue;
+                if (b[boff+1] != t[tpos+1] || b[boff+2] != t[tpos+2] || b[boff+3] != t[tpos+3]) continue;
+                size_t ml = 4;
+                size_t max_ml = base_len - (size_t)boff;
                 size_t remain = target_len - tpos;
                 if (max_ml > remain) max_ml = remain;
                 if (max_ml > 0x10000) max_ml = 0x10000;
                 while (ml < max_ml && b[boff + ml] == t[tpos + ml]) ml++;
-                if (ml > best_len) { best_len = ml; best_off = boff; if (ml >= remain) break; }
+                if (ml > best_len) { best_len = ml; best_off = (size_t)boff; if (ml >= remain || ml == 0x10000) break; }
             }
         }
         if (best_len >= 4) {
@@ -109,6 +133,7 @@ fastgit_error_t fastgit_delta_compress(const void* base, size_t base_len, const 
         }
     }
     if (lit_len) { delta[pos++] = (uint8_t)lit_len; memcpy(delta + pos, lit_buf, lit_len); pos += lit_len; }
+    free(head); free(nxt);
     *out = delta;
     *out_len = pos;
     return FASTGIT_OK;
