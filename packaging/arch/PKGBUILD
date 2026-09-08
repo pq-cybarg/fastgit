@@ -21,6 +21,7 @@ check() {
 }
 
 package() {
-  cmake --install build --prefix "$pkgdir/usr"
+  DESTDIR="$pkgdir" cmake --install build
+  install -Dm755 build/src/fastgit-cli "$pkgdir/usr/bin/fastgit"
   install -Dm644 "fastgit-v${pkgver}/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

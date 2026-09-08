@@ -1,5 +1,7 @@
 fn main() {
-    let dst = cmake::Config::new("../..")
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let root = std::path::Path::new(&manifest).join("../..").canonicalize().unwrap();
+    let dst = cmake::Config::new(&root)
         .define("FASTGIT_BUILD_TESTS", "OFF")
         .define("FASTGIT_BUILD_BENCHMARKS", "OFF")
         .define("FASTGIT_BUILD_SHARED", "OFF")

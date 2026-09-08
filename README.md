@@ -111,6 +111,24 @@ fastgit stats
 fastgit migrate sha384
 ```
 
+## Deployment
+
+Everywhere `git` is published, `fastgit` is published (C23 baremetal — no cargo/npm/pip runtime; wrappers are `fastgit-sys` / bindings).
+
+| Channel | Package | Install |
+|---|---|---|
+| **GitHub** | `pq-cybarg/fastgit` | `gh release` `v0.1.1` — `fastgit-v0.1.1-src.tar.gz (08203b5…)` `fastgit-v0.1.0-macos-arm64.tar.gz` at https://github.com/pq-cybarg/fastgit/releases |
+| **Homebrew** | `pq-cybarg/homebrew-fastgit` | `brew tap pq-cybarg/fastgit && brew install fastgit` — `Formula/fastgit.rb` `cmake -S . -B build -DFASTGIT_ENABLE_LTO=ON && cmake --build build && cmake --install build` `depends_on \"cmake\"/\"openssl@3\"/\"zlib\"` |
+| **Arch AUR** | `fastgit` | `makepkg -si` from `packaging/arch/PKGBUILD` (`source v0.1.1.tar.gz`, `arch x86_64/aarch64`, `depends openssl zlib curl libssh`, `makedepends cmake`) — `build() cmake -S fastgit-v0.1.1 -B build -DCMAKE_BUILD_TYPE=Release -DFASTGIT_ENABLE_LTO=ON`, `check() ctest`, `package() DESTDIR=\"$pkgdir\" cmake --install build` — `src/CMakeLists.txt:104` now `include(GNUInstallDirs)` + `install(TARGETS fastgit fastgit_static fastgit-cli)` so `cmake --install` works; Darwin cannot run `makepkg` (no `pacman`), `archlinux:latest` container blocked by `seccomp 22 alpm` — verified via mocked `cmake -S /tmp/pkgbuild-test/fastgit-v0.1.1 -B build` → `10/10 2.06s` + `DESTDIR=/tmp/fgtest-install` installs `libfastgit.0.1.0.dylib` `libfastgit.a` `include/fastgit/*.h` `bin/fastgit-cli 33K` |
+| **Cargo** | `fastgit-sys 0.1.1` | `packaging/cargo/{Cargo.toml,build.rs,src/lib.rs}` `links=fastgit` `build-dependencies cmake/pkg-config 0.3` — `cargo publish --dry-run --allow-dirty` ok (`pkg-config 0.5` → `0.3` fix); note `build.rs` canonicalizes `CARGO_MANIFEST_DIR/../../` to repo root — `cargo verify` isolates package temp without `CMakeLists.txt` so dry-run warns but real publish uses git source |
+| **npm** | `fastgit 0.1.1` | `packaging/npm/{package.json,binding.gyp,fastgit.cc,index.js}` `cargo publish --dry-run` → `packaging/npm: npm publish --dry-run` `1.7kB 5 files shasum 5d7bf…` `npm pack` verified |
+| **PyPI** | `fastgit 0.1.1` | `packaging/pypi/{pyproject.toml,fastgit/__init__.py}` `[project.urls] Homepage/Repository` (fixed `homepage`/`repository` invalid) — `python3 -m build --wheel` → `fastgit-0.1.1-py3-none-any.whl 1.7K` `twine check PASSED` (`ctypes` wrapper, `fastgit-cli` expected in `PATH`) |
+| **Debian** | `fastgit` | `packaging/debian/{control,rules,changelog,compat}` `dpkg-buildpackage -b` cmake build ctest |
+| **Scoop** | `fastgit` | `packaging/scoop/fastgit.json` `checkver`/`autoupdate` from GitHub releases |
+| **Docker** | `packaging/docker/Dockerfile.ubuntu` | `docker build -f packaging/docker/Dockerfile.ubuntu .` `ubuntu:22.04` `cmake -S . -B build && cmake --build build && ctest` `10/10 0.07s` |
+
+Portability: `FASTGIT_HAVE_IO_URING` conditional on `liburing.h` (`pkg_check_modules` + `CheckIncludeFile`) — Linux without `liburing` builds without `io_uring` (`ubuntu:22.04` `10/10 0.07s` vs previous `fatal error: liburing.h`). Hash-agile `20/32/48/64` (`index.h:oid[64]`, `pack hash_len 20/32/48/64 loop`) preserves GitHub `sha1` compat (`a6dff50`) while default `sha256`.
+
 ## Configuration
 
 Supported in v0.2 is the git-interop `.git/config`:

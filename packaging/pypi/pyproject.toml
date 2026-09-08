@@ -13,11 +13,11 @@ maintainers = [{name="pq-cybarg", email="resistant@tuta.com"}]
 keywords = ["git", "vcs", "sha256"]
 classifiers = ["Programming Language :: Python :: 3", "License :: OSI Approved :: MIT License", "Topic :: Software Development :: Version Control"]
 requires-python = ">=3.8"
-homepage = "https://github.com/pq-cybarg/fastgit"
-repository = "https://github.com/pq-cybarg/fastgit"
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/pq-cybarg/fastgit"
+Repository = "https://github.com/pq-cybarg/fastgit"
 
 [tool.setuptools]
 packages = ["fastgit"]

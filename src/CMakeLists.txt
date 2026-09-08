@@ -95,3 +95,13 @@ endif()
 
 add_executable(fastgit-cli cli/main.c)
 target_link_libraries(fastgit-cli PRIVATE fastgit)
+
+include(GNUInstallDirs)
+install(TARGETS fastgit fastgit_static fastgit-cli
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../include/fastgit
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)

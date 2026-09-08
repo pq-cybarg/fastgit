@@ -23,3 +23,9 @@ Testing/
 # Bench temp files
 /tmp/
 build-linux/
+# Packaging build artifacts (not published)
+packaging/cargo/target/
+packaging/pypi/dist/
+packaging/pypi/fastgit.egg-info/
+packaging/pypi/build/
+packaging/npm/*.tgz
