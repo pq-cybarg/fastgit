@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #endif
 
+static fastgit_error_t odb_path_from_index(const fastgit_index_t* idx, char* out, size_t outsz);
 static int index_entry_cmp(const void* a, const void* b) {
     const fastgit_index_entry_t* ea = (const fastgit_index_entry_t*)a;
     const fastgit_index_entry_t* eb = (const fastgit_index_entry_t*)b;
@@ -377,17 +378,28 @@ fastgit_error_t fastgit_index_write_to(fastgit_index_t* index, const char* path)
     fastgit_hash(index->oid_algo, buf, ptr - (uint8_t*)buf, &index->checksum);
     memcpy(ptr, index->checksum.digest, index->checksum.len ? index->checksum.len : index->oid_len);
 
-    int fd = index->vfs.open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    char lock_path[4096];
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+    int fd = index->vfs.open(lock_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         free(buf);
         return FASTGIT_EIO;
     }
-
     ssize_t written = index->vfs.write(fd, buf, total_size);
+#if !defined(_WIN32)
+    fsync(fd);
+#endif
     index->vfs.close(fd);
     free(buf);
-
-    if (written != (ssize_t)total_size) return FASTGIT_EIO;
+    if (written != (ssize_t)total_size) { index->vfs.unlink(lock_path); return FASTGIT_EIO; }
+    if (index->vfs.rename(lock_path, path) != 0) { index->vfs.unlink(lock_path); return FASTGIT_EIO; }
+#if !defined(_WIN32)
+    /* directory fsync for crash safety */
+    {
+        char dir[4096]; strncpy(dir, path, sizeof(dir)-1); dir[sizeof(dir)-1]=0;
+        char* sl=strrchr(dir,'/'); if(sl){ *sl=0; int df = open(dir, O_DIRECTORY); if(df>=0){ fsync(df); close(df);} }
+    }
+#endif
 
     index->dirty = false;
     return FASTGIT_OK;
@@ -443,13 +455,56 @@ fastgit_error_t fastgit_index_add(fastgit_index_t* index, const char* path) {
     oid.len = hash.len;
     memcpy(oid.hash, hash.digest, hash.len);
 
+    /* Git-shaped: write blob to ODB before updating cache entry */
+    if (index->path) {
+        char odb_path[4096];
+        if (odb_path_from_index(index, odb_path, sizeof(odb_path)) == FASTGIT_OK) {
+            fastgit_odb_t* odb = NULL;
+            if (fastgit_odb_open(odb_path, &odb) == FASTGIT_OK) {
+                fastgit_oid_t woid;
+                /* odb_write re-serializes header; use raw data */
+                fastgit_odb_write(odb, FASTGIT_OBJ_BLOB, data ? data : "", file_size, &woid);
+                fastgit_odb_free(odb);
+            }
+        }
+    }
+
     uint32_t mode = S_IFREG | 0644;
     if (fst.st_mode & S_IXUSR) mode = S_IFREG | 0755;
+
+    /* replace by (path, stage) like Git, not append */
+    for (size_t i = 0; i < index->count; i++) {
+        if (index->entries[i].stage == FASTGIT_INDEX_STAGE_NORMAL && strcmp(index->entries[i].path, path) == 0) {
+            /* update in place */
+            index->entries[i].oid = oid;
+            index->entries[i].mode = mode;
+            index->entries[i].size = (uint32_t)file_size;
+            index->entries[i].ctime_sec = (uint32_t)fst.st_ctime;
+#if defined(__APPLE__)
+            index->entries[i].ctime_nsec = 0;
+            index->entries[i].mtime_sec = (uint32_t)fst.st_mtime;
+            index->entries[i].mtime_nsec = 0;
+#else
+            index->entries[i].ctime_nsec = (uint32_t)fst.st_ctim.tv_nsec;
+            index->entries[i].mtime_sec = (uint32_t)fst.st_mtim.tv_sec;
+            index->entries[i].mtime_nsec = (uint32_t)fst.st_mtim.tv_nsec;
+#endif
+            index->entries[i].dev = (uint32_t)fst.st_dev;
+            index->entries[i].ino = (uint32_t)fst.st_ino;
+            index->entries[i].uid = (uint32_t)fst.st_uid;
+            index->entries[i].gid = (uint32_t)fst.st_gid;
+            index->entries[i].flags = (uint16_t)(strlen(path) & 0xFFF);
+            free(data);
+            index->dirty = true;
+            /* keep sorted flag; qsort will re-sort on write */
+            return FASTGIT_OK;
+        }
+    }
 
     if (index->count >= index->capacity) {
         size_t new_cap = index->capacity ? index->capacity * 2 : 1024;
         fastgit_index_entry_t* new_entries = realloc(index->entries, new_cap * sizeof(fastgit_index_entry_t));
-        if (!new_entries) return FASTGIT_ENOMEM;
+        if (!new_entries) { free(data); return FASTGIT_ENOMEM; }
         index->entries = new_entries;
         index->capacity = new_cap;
     }
@@ -459,6 +514,7 @@ fastgit_error_t fastgit_index_add(fastgit_index_t* index, const char* path) {
     entry->path = strdup(path);
     if (!entry->path) {
         index->count--;
+        free(data);
         return FASTGIT_ENOMEM;
     }
     entry->mode = mode;
@@ -480,6 +536,7 @@ fastgit_error_t fastgit_index_add(fastgit_index_t* index, const char* path) {
     entry->uid = (uint32_t)fst.st_uid;
     entry->gid = (uint32_t)fst.st_gid;
     entry->size = (uint32_t)file_size;
+    free(data);
 
     index->dirty = true;
     index->sorted = false;
@@ -567,7 +624,31 @@ fastgit_error_t fastgit_index_add_many(fastgit_index_t* index, const char** path
         index->entries = ne;
         index->capacity = new_cap;
     }
-    // Bulk insert
+    /* Git-shaped: write blobs to ODB before index update */
+    if (index->path) {
+        char odb_path[4096];
+        if (odb_path_from_index(index, odb_path, sizeof(odb_path)) == FASTGIT_OK) {
+            fastgit_odb_t* odb = NULL;
+            if (fastgit_odb_open(odb_path, &odb) == FASTGIT_OK) {
+                for (size_t i = 0; i < count; i++) {
+                    if (tasks[i].err != FASTGIT_OK) continue;
+                    size_t len = tasks[i].file_size;
+                    void* data = NULL;
+                    if (len > 0) {
+                        data = malloc(len);
+                        if (!data) continue;
+                        int fd = open(tasks[i].path, O_RDONLY);
+                        if (fd >= 0) { ssize_t n = read(fd, data, len); (void)n; close(fd); }
+                    }
+                    fastgit_oid_t woid;
+                    fastgit_odb_write(odb, FASTGIT_OBJ_BLOB, data ? data : "", len, &woid);
+                    free(data);
+                }
+                fastgit_odb_free(odb);
+            }
+        }
+    }
+    // Bulk insert with replace-by-(path,stage) dedup
     for (size_t i = 0; i < count; i++) {
         if (tasks[i].err != FASTGIT_OK) continue;
         fastgit_oid_t oid;
@@ -576,6 +657,33 @@ fastgit_error_t fastgit_index_add_many(fastgit_index_t* index, const char** path
         memcpy(oid.hash, tasks[i].hash.digest, tasks[i].hash.len);
         uint32_t mode = S_IFREG | 0644;
         if (tasks[i].fst.st_mode & S_IXUSR) mode = S_IFREG | 0755;
+        /* check existing */
+        bool replaced = false;
+        for (size_t k = 0; k < index->count; k++) {
+            if (index->entries[k].stage == FASTGIT_INDEX_STAGE_NORMAL && strcmp(index->entries[k].path, tasks[i].path) == 0) {
+                index->entries[k].oid = oid;
+                index->entries[k].mode = mode;
+                index->entries[k].size = (uint32_t)tasks[i].file_size;
+                index->entries[k].ctime_sec = (uint32_t)tasks[i].fst.st_ctime;
+#if defined(__APPLE__)
+                index->entries[k].ctime_nsec = 0;
+                index->entries[k].mtime_sec = (uint32_t)tasks[i].fst.st_mtime;
+                index->entries[k].mtime_nsec = 0;
+#else
+                index->entries[k].ctime_nsec = (uint32_t)tasks[i].fst.st_ctim.tv_nsec;
+                index->entries[k].mtime_sec = (uint32_t)tasks[i].fst.st_mtim.tv_sec;
+                index->entries[k].mtime_nsec = (uint32_t)tasks[i].fst.st_mtim.tv_nsec;
+#endif
+                index->entries[k].dev = (uint32_t)tasks[i].fst.st_dev;
+                index->entries[k].ino = (uint32_t)tasks[i].fst.st_ino;
+                index->entries[k].uid = (uint32_t)tasks[i].fst.st_uid;
+                index->entries[k].gid = (uint32_t)tasks[i].fst.st_gid;
+                index->entries[k].flags = (uint16_t)(strlen(tasks[i].path) & 0xFFF);
+                replaced = true;
+                break;
+            }
+        }
+        if (replaced) continue;
         fastgit_index_entry_t* e = &index->entries[index->count++];
         e->oid = oid;
         e->path = strdup(tasks[i].path);
@@ -635,6 +743,29 @@ fastgit_error_t fastgit_index_add_from_buffer(fastgit_index_t* index, const char
     oid.algo = FASTGIT_HASH_SHA256;
     oid.len = h.len;
     memcpy(oid.hash, h.digest, h.len);
+
+    if (index->path) {
+        char odb_path[4096];
+        if (odb_path_from_index(index, odb_path, sizeof(odb_path)) == FASTGIT_OK) {
+            fastgit_odb_t* odb = NULL;
+            if (fastgit_odb_open(odb_path, &odb) == FASTGIT_OK) {
+                fastgit_oid_t woid;
+                fastgit_odb_write(odb, FASTGIT_OBJ_BLOB, data ? data : "", len, &woid);
+                fastgit_odb_free(odb);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < index->count; i++) {
+        if (index->entries[i].stage == FASTGIT_INDEX_STAGE_NORMAL && strcmp(index->entries[i].path, path) == 0) {
+            index->entries[i].oid = oid;
+            index->entries[i].mode = mode;
+            index->entries[i].size = (uint32_t)len;
+            index->entries[i].flags = (uint16_t)strlen(path);
+            index->dirty = true;
+            return FASTGIT_OK;
+        }
+    }
 
     fastgit_index_entry_t* entry = &index->entries[index->count++];
     entry->oid = oid;

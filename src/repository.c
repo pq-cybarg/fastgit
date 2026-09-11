@@ -88,7 +88,7 @@ fastgit_error_t fastgit_repository_init(const char* path, bool bare, fastgit_rep
         char cfg_path[4096]; snprintf(cfg_path, sizeof(cfg_path), "%s/config", repo->gitdir);
         FILE* f = fopen(cfg_path, "w");
         if (f) {
-            fputs("[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n", f);
+            fprintf(f, "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = %s\n\tlogallrefupdates = %s\n", bare ? "true" : "false", bare ? "false" : "true");
             fputs("[extensions]\n\tobjectFormat = sha256\n", f);
             fclose(f);
         }
@@ -292,23 +292,33 @@ fastgit_error_t fastgit_reference_lookup(fastgit_repository_t* repo, const char*
     }
     return FASTGIT_EIO;
 }
+static void mkdir_p(const char* path){
+    char tmp[4096]; strncpy(tmp, path, sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
+    size_t len = strlen(tmp);
+    if(len==0) return;
+    if(tmp[len-1]=='/') tmp[len-1]=0;
+    for(char* p = tmp+1; *p; p++){
+        if(*p=='/'){
+            *p=0;
+#ifdef _WIN32
+            _mkdir(tmp);
+#else
+            mkdir(tmp, 0755);
+#endif
+            *p='/';
+        }
+    }
+#ifdef _WIN32
+    _mkdir(tmp);
+#else
+    mkdir(tmp, 0755);
+#endif
+}
 static fastgit_error_t ensure_ref_dir(const char* ref_path){
     char dir[4096]; strncpy(dir, ref_path, sizeof(dir)); dir[sizeof(dir)-1]=0;
     char* slash=strrchr(dir,'/'); if(!slash) return FASTGIT_OK;
     *slash=0;
-    char cur[4096]={0}; if(dir[0]=='/') strcpy(cur,"/"); 
-    char* tok=strtok(dir,"/"); char tmp[4096];
-    // reconstruct incremental mkdir
-    // simpler: use system mkdir -p via iterating
-    char build[4096]={0};
-    if(ref_path[0]=='/') strcpy(build,"/");
-    char copy[4096]; strncpy(copy, dir, sizeof(copy));
-    // actually dir already truncated; rebuild from original
-    // fallback: call mkdir -p via creating parent dirs
-    char d2[4096]; snprintf(d2,sizeof(d2),"%s", ref_path);
-    char* ls=strrchr(d2,'/'); if(ls) *ls=0;
-    char cmd[8192]; snprintf(cmd,sizeof(cmd),"mkdir -p \"%s\"", d2);
-    (void)system(cmd);
+    mkdir_p(dir);
     return FASTGIT_OK;
 }
 static fastgit_error_t append_reflog(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* old_oid, const fastgit_oid_t* new_oid, const char* msg){
@@ -320,14 +330,17 @@ static fastgit_error_t append_reflog(fastgit_repository_t* repo, const char* nam
     else rname=name;
     snprintf(log_path,sizeof(log_path),"%s/logs/%s", repo->gitdir, rname);
     char dir[4096]; snprintf(dir,sizeof(dir),"%s/logs/%s", repo->gitdir, rname);
-    char* sl=strrchr(dir,'/'); if(sl){ *sl=0; char cmd[8192]; snprintf(cmd,sizeof(cmd),"mkdir -p \"%s\"", dir); (void)system(cmd); }
+    char* sl=strrchr(dir,'/'); if(sl){ *sl=0; mkdir_p(dir); }
     FILE* f=fopen(log_path,"a");
     if(!f) return FASTGIT_OK; // reflog optional
     char old_hex[129]={0}, new_hex[129]={0};
+    size_t hex_width = 64;
+    if(old_oid) hex_width = old_oid->len ? old_oid->len*2 : 64;
+    else if(new_oid) hex_width = new_oid->len ? new_oid->len*2 : 64;
     if(old_oid) fastgit_oid_to_hex(old_oid, old_hex, sizeof(old_hex));
-    else memset(old_hex,'0',64);
+    else memset(old_hex,'0',hex_width);
     if(new_oid) fastgit_oid_to_hex(new_oid, new_hex, sizeof(new_hex));
-    else memset(new_hex,'0',64);
+    else memset(new_hex,'0',hex_width);
     // signature
     fastgit_signature_t* sig=NULL;
     fastgit_signature_default(&sig);

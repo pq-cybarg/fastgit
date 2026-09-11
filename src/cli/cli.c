@@ -282,48 +282,40 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
                 return 1;
             }
             fastgit_index_t* idx = fastgit_repository_index(repo);
-            fastgit_odb_t* odb = fastgit_repository_odb(repo);
-            // write blobs to ODB before updating index (mirrors git add)
+            // filter flags (git add -- <paths>) — collect real pathspecs
+            const char** paths = malloc((size_t)cli->cmd_argc * sizeof(char*));
+            if (!paths) { fastgit_repository_free(repo); return 1; }
+            size_t npaths = 0;
             for (int i = 0; i < cli->cmd_argc; i++) {
-                const char* path = cli->cmd_argv[i];
-                if (path[0] == '-') continue;
-                FILE* f = fopen(path, "rb");
-                if (!f) continue;
-                fseek(f, 0, SEEK_END);
-                long sz = ftell(f);
-                fseek(f, 0, SEEK_SET);
-                if (sz < 0) sz = 0;
-                size_t len = (size_t)sz;
-                void* data = malloc(len ? len : 1);
-                if (!data) { fclose(f); continue; }
-                if (len) {
-                    size_t n = fread(data, 1, len, f);
-                    (void)n;
+                const char* p = cli->cmd_argv[i];
+                if (p[0] == '-' && p[1] != '\0') {
+                    if (strcmp(p, "--") == 0) continue;
+                    continue;
                 }
-                fclose(f);
-                fastgit_oid_t woid;
-                fastgit_odb_write(odb, FASTGIT_OBJ_BLOB, data, len, &woid);
-                free(data);
+                if (strcmp(p, "--") == 0) continue;
+                paths[npaths++] = p;
             }
-            // fast path: bulk add when multiple paths
-            if ((size_t)cli->cmd_argc > 1) {
-                const char** paths = (const char**)cli->cmd_argv;
-                err = fastgit_index_add_many(idx, paths, (size_t)cli->cmd_argc);
+            if (npaths == 0) { free((void*)paths); fastgit_repository_free(repo); fprintf(stderr, "nothing specified\n"); return 1; }
+            // single pipeline: index_add now writes blob via ODB internally
+            if (npaths > 1) {
+                err = fastgit_index_add_many(idx, paths, npaths);
                 if (err != FASTGIT_OK) {
                     fprintf(stderr, "error: add failed: %s\n", fastgit_error_string(err));
                     fastgit_repository_free(repo);
                     return 1;
                 }
             } else {
-                for (int i = 0; i < cli->cmd_argc; i++) {
-                    err = fastgit_index_add(idx, cli->cmd_argv[i]);
+                for (size_t i = 0; i < npaths; i++) {
+                    err = fastgit_index_add(idx, paths[i]);
                     if (err != FASTGIT_OK) {
-                        fprintf(stderr, "error: could not add '%s': %s\n", cli->cmd_argv[i], fastgit_error_string(err));
+                        fprintf(stderr, "error: pathspec '%s' did not match any files: %s\n", paths[i], fastgit_error_string(err));
+                        free((void*)paths);
                         fastgit_repository_free(repo);
                         return 1;
                     }
                 }
             }
+            free((void*)paths);
             err = fastgit_index_write(idx);
             if (err != FASTGIT_OK) {
                 fprintf(stderr, "error: could not write index: %s\n", fastgit_error_string(err));
@@ -487,7 +479,11 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
                     if (fastgit_object_lookup(repo,&ent->oid,&blob)==FASTGIT_OK) {
                         size_t sz = fastgit_object_size(blob); const void* data = fastgit_object_data(blob);
                         char* dup=strdup(pth); char* sl=strrchr(dup,'/');
-                        if (sl) { *sl='\0'; char cmd[1024]; snprintf(cmd,sizeof(cmd),"mkdir -p \"%s\"",dup); system(cmd); }
+                        if (sl) { *sl='\0';
+                            char tmp2[4096]; strncpy(tmp2,dup,sizeof(tmp2)-1); tmp2[sizeof(tmp2)-1]=0;
+                            for(char* p=tmp2+1;*p;p++) if(*p=='/'){*p=0; mkdir(tmp2,0755); *p='/';}
+                            mkdir(tmp2,0755);
+                        }
                         free(dup);
                         FILE* f=fopen(pth,"wb"); if(f){ fwrite(data,1,sz,f); fclose(f); }
                         fastgit_object_free(blob);
@@ -552,11 +548,16 @@ int fastgit_cli_run(fastgit_cli_t* cli) {
             fastgit_repository_free(repo); return 0;
         }
         case FASTGIT_CMD_LS_FILES: {
+            bool show_stage=false; const char* pathspec=NULL;
+            for(int i=0;i<cli->cmd_argc;i++){
+                if(strcmp(cli->cmd_argv[i],"--stage")==0 || strcmp(cli->cmd_argv[i],"-s")==0) show_stage=true;
+                else if(cli->cmd_argv[i][0]!='-' && !pathspec) pathspec=cli->cmd_argv[i];
+            }
             fastgit_repository_t* repo=NULL;
             if (fastgit_repository_open(".", &repo)!=FASTGIT_OK) { fprintf(stderr,"fatal: not a git repository\n"); return 1; }
             fastgit_index_t* idx = fastgit_repository_index(repo);
             size_t n = fastgit_index_entry_count(idx);
-            for(size_t i=0;i<n;i++) { const fastgit_index_entry_t* e = fastgit_index_entry_by_index(idx,i); if(e) printf("%s\n", e->path); }
+            for(size_t i=0;i<n;i++) { const fastgit_index_entry_t* e = fastgit_index_entry_by_index(idx,i); if(!e) continue; if(pathspec && strcmp(e->path,pathspec)!=0) continue; if(show_stage){ char hex[129]; fastgit_oid_to_hex(&e->oid,hex,sizeof(hex)); printf("%06o %s %u\t%s\n", e->mode, hex, e->stage, e->path); } else printf("%s\n", e->path); }
             fastgit_repository_free(repo); return 0;
         }
         case FASTGIT_CMD_LS_TREE: {
