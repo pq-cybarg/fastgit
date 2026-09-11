@@ -420,10 +420,32 @@ fastgit_error_t fastgit_odb_write(fastgit_odb_t* odb, fastgit_obj_type_t type, c
         free(compressed);
         return FASTGIT_ENOMEM;
     }
+    /* dedup: if loose file already exists, skip write */
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        free(compressed);
+        free(path);
+        if (odb->cache) {
+            uint32_t h = odb_hash_oid(out) & FASTGIT_ODB_CACHE_MASK;
+            for (size_t probe = 0; probe < 8; probe++) {
+                size_t idx = (h + probe) & FASTGIT_ODB_CACHE_MASK;
+                odb_cache_entry_t* e = &odb->cache[idx];
+                if (!e->occupied) {
+                    void* cpy = malloc(len ? len : 1);
+                    if (cpy) { if (len) memcpy(cpy, data, len); e->oid=*out; e->type=type; e->size=len; e->data=cpy; e->gen=odb->cache_gen++; e->occupied=true; }
+                    break;
+                }
+                if (e->oid.len==out->len && e->oid.algo==out->algo && memcmp(e->oid.hash,out->hash,out->len)==0) break;
+            }
+        }
+        return FASTGIT_OK;
+    }
 
 #if defined(_WIN32)
-    HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    char tmp_path[4096]; snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    HANDLE hFile = CreateFileA(tmp_path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS) { free(compressed); free(path); return FASTGIT_OK; }
         free(compressed);
         free(path);
         return FASTGIT_EIO;
@@ -432,23 +454,36 @@ fastgit_error_t fastgit_odb_write(fastgit_odb_t* odb, fastgit_obj_type_t type, c
     if (!WriteFile(hFile, compressed, (DWORD)compressed_len, &bytes_written, NULL) || bytes_written != compressed_len) {
         free(compressed);
         CloseHandle(hFile);
+        DeleteFileA(tmp_path);
         free(path);
         return FASTGIT_EIO;
     }
+    FlushFileBuffers(hFile);
     CloseHandle(hFile);
+    if (!MoveFileExA(tmp_path, path, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(tmp_path);
+        free(compressed);
+        free(path);
+        return FASTGIT_EIO;
+    }
 #else
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    char tmp_path[4096]; snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", path, (int)getpid());
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) {
+        if (errno == EEXIST) { free(compressed); free(path); return FASTGIT_OK; }
         free(compressed);
         free(path);
         return FASTGIT_EIO;
     }
     ssize_t n = write(fd, compressed, compressed_len);
+    if (n != (ssize_t)compressed_len) { close(fd); unlink(tmp_path); free(compressed); free(path); return FASTGIT_EIO; }
+    fsync(fd);
     close(fd);
-    if (n != (ssize_t)compressed_len) {
-        free(compressed);
-        free(path);
-        return FASTGIT_EIO;
+    if (rename(tmp_path, path) != 0) { unlink(tmp_path); free(compressed); free(path); return FASTGIT_EIO; }
+    /* directory fsync for durability */
+    {
+        char dir[4096]; strncpy(dir, path, sizeof(dir)-1); dir[sizeof(dir)-1]=0;
+        char* sl=strrchr(dir,'/'); if(sl){ *sl=0; int df = open(dir, O_DIRECTORY); if(df>=0){ fsync(df); close(df);} }
     }
 #endif
 
