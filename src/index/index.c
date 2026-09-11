@@ -275,7 +275,10 @@ fastgit_error_t fastgit_index_read(fastgit_index_t* index, const char* path) {
             entry->flags = be_flags;
             entry->stage = (be_flags >> 12) & 0x3;
             const char* path_start = (const char*)ptr;
-            entry->path = strdup(path_start ? path_start : "");
+            size_t remaining = (size_t)(end - ptr);
+            size_t bounded_len = strnlen(path_start, remaining);
+            if (bounded_len == remaining) { munmap(mapped, file_size); close(fd); return FASTGIT_ERROR; }
+            entry->path = strdup(path_start);
             if (!entry->path) {
                 munmap(mapped, file_size);
                 close(fd);
@@ -287,7 +290,7 @@ fastgit_error_t fastgit_index_read(fastgit_index_t* index, const char* path) {
                 actual = 0;
                 while (ptr + actual < end && ptr[actual]) actual++;
             } else {
-                actual = strlen(path_start);
+                actual = bounded_len;
             }
             size_t entry_len = fixed_sz + actual + 1;
             ptr += actual + 1;
