@@ -26,10 +26,12 @@ Scope: nothing is out of scope. v0.2 ships loose ODB + index + hash (see §9); p
 
 | Operation | Measured | Notes |
 |-----------|----------|-------|
-| `hash-object` (SHA-256) | ~1830 MB/s | OpenSSL EVP when available |
-| ODB write (hot cache, same blob) | ~0.6–1.0M ops/s | 16K cache hit, no serialize/write |
-| ODB write (durable distinct) | ~10k ops/s | serialize+zlib+open/write per object |
-| ODB read (hot / distinct) | ~19M / ~2.3M ops/s | cache vs loose zlib inflate |
+| `hash-object` (SHA-256) | ~1.4 GB/s | OpenSSL EVP when available (`FASTGIT_HAVE_OPENSSL=1`) |
+| ODB write (hot cache, same blob) | ~1.2M ops/s | 16K 8-probe cache hit, no serialize/write |
+| ODB write (durable distinct) | ~3.5k ops/s | `tmp.<pid> + fsync + rename + dir fsync` per loose `ab/cdef` (was `~10k` before `O_TRUNC` → now crash-safe) |
+| ODB write (pack batch, 10k/pack) | ~8.5k ops/s | single `pack-*.pack + .idx` `1 fsync` amortized |
+| ODB read (hot / distinct) | ~27M / ~2.0M ops/s | cache vs loose zlib inflate; `pack mmap` ~0.95M |
+| `add` 1000 files (durable, bulk) | ~6.4k ops/s | `index_add` Git-shaped `blob header + odb_write + replace (path,stage)` — vs `git add` `~1.1k` on same tree (`5.8×`) |
 | index add/find/remove | ~3.0M / 3.2M / 5.5M ops/s | in-memory; bulk add with hashing |
 
 ## Building
