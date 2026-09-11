@@ -137,7 +137,7 @@ static __attribute__((unused)) fastgit_error_t odb_decompress(const void* data, 
 
 static inline uint32_t odb_hash_oid(const fastgit_oid_t* oid) {
     uint32_t h = 2166136261u;
-    for (size_t i = 0; i < oid->len && i < 8; i++) { h ^= oid->hash[i]; h *= 16777619u; }
+    for (size_t i = 0; i < oid->len; i++) { h ^= oid->hash[i]; h *= 16777619u; }
     h ^= oid->algo; h *= 16777619u;
     return h;
 }
