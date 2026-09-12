@@ -26,13 +26,14 @@ Scope: nothing is out of scope. v0.2 ships loose ODB + index + hash (see §9); p
 
 | Operation | Measured | Notes |
 |-----------|----------|-------|
-| `hash-object` (SHA-256) | ~1.4 GB/s | OpenSSL EVP when available (`FASTGIT_HAVE_OPENSSL=1`) |
-| ODB write (hot cache, same blob) | ~1.2M ops/s | 16K 8-probe cache hit, no serialize/write |
-| ODB write (durable distinct) | ~3.5k ops/s | `tmp.<pid> + fsync + rename + dir fsync` per loose `ab/cdef` (was `~10k` before `O_TRUNC` → now crash-safe) |
-| ODB write (pack batch, 10k/pack) | ~8.5k ops/s | single `pack-*.pack + .idx` `1 fsync` amortized |
-| ODB read (hot / distinct) | ~27M / ~2.0M ops/s | cache vs loose zlib inflate; `pack mmap` ~0.95M |
-| `add` 1000 files (durable, bulk) | ~6.4k ops/s | `index_add` Git-shaped `blob header + odb_write + replace (path,stage)` — vs `git add` `~1.1k` on same tree (`5.8×`) |
-| index add/find/remove | ~3.0M / 3.2M / 5.5M ops/s | in-memory; bulk add with hashing |
+| `hash-object` (SHA-256) | ~1.6 GB/s | OpenSSL EVP `__thread` reuse (`FASTGIT_HAVE_OPENSSL=1`), 60ms/100k×1KB; `openssl speed sha256 -bytes 1024` ~2.0 GB/s |
+| ODB write (hot cache, same blob) | ~1.3M ops/s | 16K 8-probe cache hit, no serialize/write (7.5ms/10k) |
+| ODB write (durable distinct) | ~5.1k ops/s | `tmp.<pid> + fsync + rename + dir fsync` per loose `ab/cdef` (1946ms/10k crash-safe; `O_TRUNC` → `O_EXCL` fix) |
+| ODB write (pack batch, 10k/pack) | ~7.8k ops/s | single `pack-*.pack + .idx` `1 fsync` amortized (1281ms/10k) |
+| ODB read (hot / distinct) | ~15M / ~1.9M ops/s | cache vs loose zlib inflate; `pack mmap` ~1.1M |
+| `add` 1000 files (durable, bulk) | ~5.5k ops/s | `index_add_many` Git-shaped `blob header + odb_write + replace (path,stage)` parallel; `bench_full` 178ms/1000 (`5×` vs `git add ~1.1k`) |
+| index add (bench_index, per-entry durable) | ~1.9k ops/s | `fastgit_index_add_from_buffer` now Git-shaped: hash + `odb_write` (fsync) per entry (50301ms/100k); `bench_full` bulk `~5.5k` amortizes |
+| index find/remove | ~1.4M / ~1.2M ops/s | in-memory `bsearch` after `sorted` + `mmap` cache |
 
 ## Building
 

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include "fastgit/endian.h"
 #include <stdbool.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -585,7 +586,7 @@ static fastgit_error_t unpack_pack_to_odb(fastgit_repository_t* repo, const uint
     // We'll reuse packfile.c's parse helpers via inline copy (varint header)
     size_t off = 12; // after PACK header
     uint32_t obj_count = 0;
-    if (pack_len >= 12) obj_count = __builtin_bswap32(*(uint32_t*)(pack_data + 8));
+    if (pack_len >= 12) obj_count = FASTGIT_BSWAP32(*(uint32_t*)(pack_data + 8));
     // cache for ofs deltas: map offset->data
     typedef struct { uint64_t off; void* data; size_t len; fastgit_obj_type_t type; } cache_ent_t;
     cache_ent_t* cache = calloc(obj_count ? obj_count : 16, sizeof(cache_ent_t));

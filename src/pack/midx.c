@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "fastgit/endian.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -94,15 +95,15 @@ fastgit_error_t fastgit_midx_create(const char* midx_file, const char** pack_dir
     for (int i = 0; i < 256; i++) { cum += fanout[i]; fanout[i] = cum; }
     int fd = open(midx_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { free(entries); return FASTGIT_EIO; }
-    uint32_t sig = __builtin_bswap32(0x4D494458);
-    uint32_t ver = __builtin_bswap32(1);
-    uint32_t pc = __builtin_bswap32((uint32_t)pack_count);
+    uint32_t sig = FASTGIT_BSWAP32(0x4D494458);
+    uint32_t ver = FASTGIT_BSWAP32(1);
+    uint32_t pc = FASTGIT_BSWAP32((uint32_t)pack_count);
     if (write(fd, &sig, 4) != 4 || write(fd, &ver, 4) != 4 || write(fd, &pc, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; }
-    for (size_t i = 0; i < pack_count; i++) { uint32_t pid = __builtin_bswap32((uint32_t)i); if (write(fd, &pid, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
-    for (int i = 0; i < 256; i++) { uint32_t v = __builtin_bswap32(fanout[i]); if (write(fd, &v, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
+    for (size_t i = 0; i < pack_count; i++) { uint32_t pid = FASTGIT_BSWAP32((uint32_t)i); if (write(fd, &pid, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
+    for (int i = 0; i < 256; i++) { uint32_t v = FASTGIT_BSWAP32(fanout[i]); if (write(fd, &v, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
     for (size_t i = 0; i < count; i++) if (write(fd, entries[i].oid.hash, (int)oid_len) != (int)oid_len) { close(fd); free(entries); return FASTGIT_EIO; }
     for (size_t i = 0; i < count; i++) { uint8_t p = entries[i].pack_idx; if (write(fd, &p, 1) != 1) { close(fd); free(entries); return FASTGIT_EIO; } }
-    for (size_t i = 0; i < count; i++) { uint32_t off = __builtin_bswap32((uint32_t)entries[i].offset); if (write(fd, &off, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
+    for (size_t i = 0; i < count; i++) { uint32_t off = FASTGIT_BSWAP32((uint32_t)entries[i].offset); if (write(fd, &off, 4) != 4) { close(fd); free(entries); return FASTGIT_EIO; } }
     uint8_t checksum[64] = {0};
     if (write(fd, checksum, (int)oid_len) != (int)oid_len) { close(fd); free(entries); return FASTGIT_EIO; }
     close(fd);
@@ -170,16 +171,16 @@ fastgit_error_t fastgit_midx_open(const char* midx_file, fastgit_midx_t** out) {
         return FASTGIT_ERROR;
     }
 
-    uint32_t signature = __builtin_bswap32(*(uint32_t*)ptr);
+    uint32_t signature = FASTGIT_BSWAP32(*(uint32_t*)ptr);
     ptr += 4;
     if (signature != 0x4D494458) {
         fastgit_midx_free(midx);
         return FASTGIT_ERROR;
     }
 
-    midx->version = __builtin_bswap32(*(uint32_t*)ptr);
+    midx->version = FASTGIT_BSWAP32(*(uint32_t*)ptr);
     ptr += 4;
-    midx->pack_count = __builtin_bswap32(*(uint32_t*)ptr);
+    midx->pack_count = FASTGIT_BSWAP32(*(uint32_t*)ptr);
     ptr += 4;
 
     if (midx->mapped_size < 12 + midx->pack_count * 4) {
@@ -193,13 +194,13 @@ fastgit_error_t fastgit_midx_open(const char* midx_file, fastgit_midx_t** out) {
         return FASTGIT_ENOMEM;
     }
     for (uint32_t i = 0; i < midx->pack_count; i++) {
-        midx->pack_ids[i] = __builtin_bswap32(*(uint32_t*)ptr);
+        midx->pack_ids[i] = FASTGIT_BSWAP32(*(uint32_t*)ptr);
         ptr += 4;
     }
 
     midx->object_count = 0;
     for (int i = 0; i < 256; i++) {
-        uint32_t count = __builtin_bswap32(*(uint32_t*)ptr);
+        uint32_t count = FASTGIT_BSWAP32(*(uint32_t*)ptr);
         ptr += 4;
         if (i == 255) midx->object_count = count;
     }
@@ -247,7 +248,7 @@ fastgit_error_t fastgit_midx_open(const char* midx_file, fastgit_midx_t** out) {
         return FASTGIT_ENOMEM;
     }
     for (uint32_t i = 0; i < midx->object_count; i++) {
-        uint32_t offset = __builtin_bswap32(*(uint32_t*)ptr);
+        uint32_t offset = FASTGIT_BSWAP32(*(uint32_t*)ptr);
         midx->offsets[i] = offset;
         ptr += 4;
     }
@@ -289,8 +290,8 @@ fastgit_error_t fastgit_midx_find(fastgit_midx_t* midx, const fastgit_oid_t* oid
 
     uint32_t first = oid->hash[0];
     uint8_t* fanout = (uint8_t*)midx->mapped + 12 + midx->pack_count * 4;
-    uint32_t lo = (first == 0) ? 0 : __builtin_bswap32(*(uint32_t*)(fanout + (first - 1) * 4));
-    uint32_t hi = __builtin_bswap32(*(uint32_t*)(fanout + first * 4));
+    uint32_t lo = (first == 0) ? 0 : FASTGIT_BSWAP32(*(uint32_t*)(fanout + (first - 1) * 4));
+    uint32_t hi = FASTGIT_BSWAP32(*(uint32_t*)(fanout + first * 4));
 
     while (lo < hi) {
         uint32_t mid = (lo + hi) / 2;

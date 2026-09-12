@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 struct fastgit_repository {
     char* path;
@@ -18,7 +19,10 @@ struct fastgit_repository {
     fastgit_worktree_t* worktree;
 };
 
-static fastgit_stats_t g_stats = {0};
+static _Atomic uint64_t g_objects_read = 0;
+static _Atomic uint64_t g_objects_written = 0;
+static _Atomic uint64_t g_bytes_read = 0;
+static _Atomic uint64_t g_bytes_written = 0;
 
 const char* fastgit_version(void) {
     return "0.1.0";
@@ -41,8 +45,30 @@ const char* fastgit_error_string(fastgit_error_t err) {
     }
 }
 
-void fastgit_stats_reset(void) { memset(&g_stats, 0, sizeof(g_stats)); }
-fastgit_stats_t fastgit_stats_get(void) { return g_stats; }
+void fastgit_stats_reset(void) {
+    atomic_store(&g_objects_read, 0);
+    atomic_store(&g_objects_written, 0);
+    atomic_store(&g_bytes_read, 0);
+    atomic_store(&g_bytes_written, 0);
+}
+fastgit_stats_t fastgit_stats_get(void) {
+    fastgit_stats_t s;
+    s.objects_read = atomic_load(&g_objects_read);
+    s.objects_written = atomic_load(&g_objects_written);
+    s.bytes_read = atomic_load(&g_bytes_read);
+    s.bytes_written = atomic_load(&g_bytes_written);
+    s.cpu_time_ms = 0;
+    s.wall_time_ms = 0;
+    return s;
+}
+void fastgit_stats_add_read(uint64_t n, uint64_t bytes) {
+    atomic_fetch_add(&g_objects_read, n);
+    atomic_fetch_add(&g_bytes_read, bytes);
+}
+void fastgit_stats_add_written(uint64_t n, uint64_t bytes) {
+    atomic_fetch_add(&g_objects_written, n);
+    atomic_fetch_add(&g_bytes_written, bytes);
+}
 
 static void ensure_dir(const char* p) {
 #if defined(_WIN32)

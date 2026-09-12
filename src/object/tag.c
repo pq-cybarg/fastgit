@@ -3,16 +3,6 @@
 #include <string.h>
 #include <stdio.h>
 
-struct fastgit_tag {
-    fastgit_object_t base;
-    fastgit_oid_t object;
-    fastgit_obj_type_t object_type;
-    char* name;
-    fastgit_signature_t* tagger;
-    char* message;
-    char* gpg_signature;
-};
-
 static void tag_data_free(void* p) {
     struct fastgit_tag* t = (struct fastgit_tag*)p;
     if (!t) return;

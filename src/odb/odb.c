@@ -2,6 +2,7 @@
 #include "fastgit/object.h"
 #include "fastgit/hash.h"
 #include "fastgit/pack.h"
+#include "fastgit/platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -468,7 +469,47 @@ fastgit_error_t fastgit_odb_write(fastgit_odb_t* odb, fastgit_obj_type_t type, c
     }
 #else
     char tmp_path[4096]; snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", path, (int)getpid());
-    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    /* try io_uring hardware scheduling for WRITE+FSYNC chain; fallback to portable */
+    bool used_uring = false;
+#if defined(__linux__) && defined(FASTGIT_HAVE_IO_URING)
+    {
+        int fd2 = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd2 >= 0) {
+            fastgit_io_context_t* ictx = NULL;
+            if (fastgit_io_context_new(&ictx) == FASTGIT_OK) {
+                fastgit_io_context_set_backend(ictx, FASTGIT_IO_BACKEND_IO_URING);
+                if (fastgit_io_uring_init(ictx, 8) == FASTGIT_OK) {
+                    fastgit_io_request_t wr = { .op = FASTGIT_IO_OP_WRITE, .fd = fd2, .buf = compressed, .len = compressed_len, .offset = 0 };
+                    fastgit_io_request_t fs = { .op = FASTGIT_IO_OP_FSYNC, .fd = fd2 };
+                    fastgit_io_request_t* reqs[2] = { &wr, &fs };
+                    if (fastgit_io_uring_submit(ictx, reqs, 2) == FASTGIT_OK) {
+                        int done = 0; fastgit_io_uring_wait(ictx, reqs, 2, &done);
+                        if (done == 2) used_uring = true;
+                    }
+                }
+                fastgit_io_uring_cleanup(ictx);
+                fastgit_io_context_free(ictx);
+            }
+            close(fd2);
+            if (!used_uring) { unlink(tmp_path); fd2 = -1; }
+            else {
+                if (rename(tmp_path, path) != 0) { unlink(tmp_path); free(compressed); free(path); return FASTGIT_EIO; }
+            }
+        } else if (errno == EEXIST) { free(compressed); free(path); return FASTGIT_OK; }
+        else { free(compressed); free(path); return FASTGIT_EIO; }
+    }
+    if (!used_uring)
+#endif
+    {
+    int fd = -1;
+#if defined(__linux__) && defined(FASTGIT_HAVE_IO_URING)
+    if (!used_uring) fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    else fd = -2; /* already handled */
+    if (fd == -2) { /* uring path already renamed */ }
+    else
+#endif
+    {
+    fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) {
         if (errno == EEXIST) { free(compressed); free(path); return FASTGIT_OK; }
         free(compressed);
@@ -480,6 +521,8 @@ fastgit_error_t fastgit_odb_write(fastgit_odb_t* odb, fastgit_obj_type_t type, c
     fsync(fd);
     close(fd);
     if (rename(tmp_path, path) != 0) { unlink(tmp_path); free(compressed); free(path); return FASTGIT_EIO; }
+    }
+    }
     /* directory fsync for durability */
     {
         char dir[4096]; strncpy(dir, path, sizeof(dir)-1); dir[sizeof(dir)-1]=0;

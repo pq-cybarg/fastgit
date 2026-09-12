@@ -91,6 +91,10 @@ struct fastgit_index {
     fastgit_index_vfs_t vfs;
     fastgit_hash_t checksum;
     uint64_t mtime;
+    // baremetal: O(1) path+stage lookup via open-address hash (FNV-1a)
+    size_t* ht;          // index into entries, SIZE_MAX = empty, SIZE_MAX-1 = tombstone
+    size_t ht_cap;       // power of two
+    size_t ht_mask;
 };
 
 typedef enum {

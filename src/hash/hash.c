@@ -61,6 +61,48 @@ fastgit_error_t fastgit_hash(uint8_t algo, const void* data, size_t len, fastgit
             }
         }
     }
+    if (algo == FASTGIT_HASH_SHA3_256) {
+        static __thread EVP_MD_CTX* tls3_256 = NULL;
+        if (!tls3_256) tls3_256 = EVP_MD_CTX_new();
+        if (tls3_256) {
+            unsigned int olen = 32;
+            if (EVP_DigestInit_ex(tls3_256, EVP_sha3_256(), NULL) == 1 &&
+                EVP_DigestUpdate(tls3_256, data, len) == 1 &&
+                EVP_DigestFinal_ex(tls3_256, out->digest, &olen) == 1) {
+                out->algo = algo;
+                out->len = 32;
+                return FASTGIT_OK;
+            }
+        }
+    }
+    if (algo == FASTGIT_HASH_SHA3_384) {
+        static __thread EVP_MD_CTX* tls3_384 = NULL;
+        if (!tls3_384) tls3_384 = EVP_MD_CTX_new();
+        if (tls3_384) {
+            unsigned int olen = 48;
+            if (EVP_DigestInit_ex(tls3_384, EVP_sha3_384(), NULL) == 1 &&
+                EVP_DigestUpdate(tls3_384, data, len) == 1 &&
+                EVP_DigestFinal_ex(tls3_384, out->digest, &olen) == 1) {
+                out->algo = algo;
+                out->len = 48;
+                return FASTGIT_OK;
+            }
+        }
+    }
+    if (algo == FASTGIT_HASH_SHA3_512) {
+        static __thread EVP_MD_CTX* tls3_512 = NULL;
+        if (!tls3_512) tls3_512 = EVP_MD_CTX_new();
+        if (tls3_512) {
+            unsigned int olen = 64;
+            if (EVP_DigestInit_ex(tls3_512, EVP_sha3_512(), NULL) == 1 &&
+                EVP_DigestUpdate(tls3_512, data, len) == 1 &&
+                EVP_DigestFinal_ex(tls3_512, out->digest, &olen) == 1) {
+                out->algo = algo;
+                out->len = 64;
+                return FASTGIT_OK;
+            }
+        }
+    }
 #endif
     const fastgit_hash_vtable_t* vtable = fastgit_hash_get_vtable(algo);
     if (!vtable) return FASTGIT_EUNSUPPORTED;

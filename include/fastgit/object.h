@@ -61,7 +61,7 @@ typedef struct fastgit_signature {
     int offset;
 } fastgit_signature_t;
 
-struct fastgit_commit_t {
+struct fastgit_commit {
     fastgit_oid_t tree;
     size_t parent_count;
     fastgit_oid_t* parents;
@@ -72,7 +72,7 @@ struct fastgit_commit_t {
     char* gpg_signature;
 };
 
-struct fastgit_tag_t {
+struct fastgit_tag {
     fastgit_oid_t object;
     fastgit_obj_type_t object_type;
     char* name;

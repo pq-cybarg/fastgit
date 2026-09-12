@@ -5,7 +5,7 @@
 #include <time.h>
 #include <assert.h>
 
-#define ITERATIONS 100000
+#define ITERATIONS 10000
 
 static int cmp_strptr(const void* a, const void* b) { return strcmp(*(const char* const*)a, *(const char* const*)b); }
 static double time_diff(struct timespec start, struct timespec end) {

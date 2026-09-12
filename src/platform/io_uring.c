@@ -23,7 +23,15 @@ fastgit_error_t fastgit_io_uring_init(fastgit_io_context_t* ctx, int entries) {
 }
 
 void fastgit_io_uring_cleanup(fastgit_io_context_t* ctx) {
+    if (!ctx || !ctx->uring_ctx) { (void)ctx; return; }
+#if defined(__linux__) && defined(FASTGIT_HAVE_IO_URING)
+    struct fastgit_io_uring_context* uctx = (struct fastgit_io_uring_context*)ctx->uring_ctx;
+    if (uctx && uctx->initialized) io_uring_queue_exit(&uctx->ring);
+    free(uctx);
+    ctx->uring_ctx = NULL;
+#else
     (void)ctx;
+#endif
 }
 
 fastgit_error_t fastgit_io_uring_submit(fastgit_io_context_t* ctx, fastgit_io_request_t** reqs, size_t count) {
@@ -34,7 +42,13 @@ fastgit_error_t fastgit_io_uring_submit(fastgit_io_context_t* ctx, fastgit_io_re
     for (size_t i = 0; i < count; i++) {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&uctx->ring);
         if (!sqe) return FASTGIT_EBUSY;
-        io_uring_prep_read(sqe, reqs[i]->fd, reqs[i]->buf, (unsigned)reqs[i]->len, (off_t)reqs[i]->offset);
+        if (reqs[i]->op == FASTGIT_IO_OP_WRITE)
+            io_uring_prep_write(sqe, reqs[i]->fd, reqs[i]->buf, (unsigned)reqs[i]->len, (off_t)reqs[i]->offset);
+        else if (reqs[i]->op == FASTGIT_IO_OP_FSYNC)
+            io_uring_prep_fsync(sqe, reqs[i]->fd, 0);
+        else
+            io_uring_prep_read(sqe, reqs[i]->fd, reqs[i]->buf, (unsigned)reqs[i]->len, (off_t)reqs[i]->offset);
+        if (i + 1 < count && reqs[i+1]->op == FASTGIT_IO_OP_FSYNC && reqs[i]->op == FASTGIT_IO_OP_WRITE) sqe->flags |= IOSQE_IO_LINK;
         io_uring_sqe_set_data(sqe, reqs[i]);
     }
     int rc = io_uring_submit(&uctx->ring);

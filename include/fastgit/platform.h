@@ -33,7 +33,14 @@ void fastgit_io_context_free(fastgit_io_context_t* ctx);
 fastgit_error_t fastgit_io_context_set_backend(fastgit_io_context_t* ctx, fastgit_io_backend_t backend);
 fastgit_io_backend_t fastgit_io_context_backend(fastgit_io_context_t* ctx);
 
+typedef enum {
+    FASTGIT_IO_OP_READ = 0,
+    FASTGIT_IO_OP_WRITE = 1,
+    FASTGIT_IO_OP_FSYNC = 2,
+} fastgit_io_op_t;
+
 typedef struct {
+    fastgit_io_op_t op;
     int fd;
     void* buf;
     size_t len;

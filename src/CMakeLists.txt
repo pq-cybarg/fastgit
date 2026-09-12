@@ -34,6 +34,12 @@ set(FASTGIT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/kqueue.c
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/simd.c
     ${CMAKE_CURRENT_SOURCE_DIR}/cli/cli.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/cmd_basic.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/cmd_index.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/cmd_refs.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/cmd_network.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/cmd_plumbing.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/cmd_misc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/repository.c
 )
 
@@ -62,20 +68,21 @@ if(FASTGIT_BUILD_STATIC)
     )
 endif()
 
-if(FASTGIT_USE_OPENSSL)
-    target_link_libraries(fastgit PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+if(TARGET fastgit)
+    if(FASTGIT_USE_OPENSSL)
+        target_link_libraries(fastgit PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    endif()
+    if(CURL_FOUND)
+        target_include_directories(fastgit PUBLIC ${CURL_INCLUDE_DIRS})
+        target_link_libraries(fastgit PUBLIC ${CURL_LIBRARIES})
+    endif()
+    if(LIBSSH_FOUND)
+        target_include_directories(fastgit PUBLIC ${LIBSSH_INCLUDE_DIRS})
+        target_link_directories(fastgit PUBLIC ${LIBSSH_LIBRARY_DIRS})
+        target_link_libraries(fastgit PUBLIC ${LIBSSH_LIBRARIES})
+    endif()
+    target_link_libraries(fastgit PUBLIC Threads::Threads ZLIB::ZLIB)
 endif()
-if(CURL_FOUND)
-    target_include_directories(fastgit PUBLIC ${CURL_INCLUDE_DIRS})
-    target_link_libraries(fastgit PUBLIC ${CURL_LIBRARIES})
-endif()
-if(LIBSSH_FOUND)
-    target_include_directories(fastgit PUBLIC ${LIBSSH_INCLUDE_DIRS})
-    target_link_directories(fastgit PUBLIC ${LIBSSH_LIBRARY_DIRS})
-    target_link_libraries(fastgit PUBLIC ${LIBSSH_LIBRARIES})
-endif()
-
-target_link_libraries(fastgit PUBLIC Threads::Threads ZLIB::ZLIB)
 
 if(TARGET fastgit_static)
     target_link_libraries(fastgit_static PUBLIC Threads::Threads ZLIB::ZLIB)
@@ -94,12 +101,28 @@ if(TARGET fastgit_static)
 endif()
 
 add_executable(fastgit-cli cli/main.c)
-target_link_libraries(fastgit-cli PRIVATE fastgit)
+if(TARGET fastgit)
+    target_link_libraries(fastgit-cli PRIVATE fastgit)
+else()
+    target_link_libraries(fastgit-cli PRIVATE fastgit_static)
+endif()
 
 include(GNUInstallDirs)
-install(TARGETS fastgit fastgit_static fastgit-cli
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+if(TARGET fastgit)
+    install(TARGETS fastgit
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+if(TARGET fastgit_static)
+    install(TARGETS fastgit_static
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+install(TARGETS fastgit-cli
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../include/fastgit
