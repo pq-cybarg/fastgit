@@ -7,6 +7,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <unistd.h>
+
+static void fg_add_push(char ***out, size_t *cnt, size_t *cap, const char *p) {
+    if (*cnt >= *cap) { size_t nc = *cap ? *cap*2 : 64; char **n = realloc(*out, nc*sizeof(char*)); if(!n) return; *out=n; *cap=nc; }
+    (*out)[(*cnt)++] = strdup(p);
+}
+static void fg_add_expand(const char *base, char ***out, size_t *cnt, size_t *cap) {
+    struct stat st;
+    if (lstat(base, &st) != 0) { fg_add_push(out,cnt,cap,base); return; }
+    if (!S_ISDIR(st.st_mode)) { fg_add_push(out,cnt,cap,base); return; }
+    DIR *d = opendir(base);
+    if (!d) { fg_add_push(out,cnt,cap,base); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strcmp(e->d_name,".")==0 || strcmp(e->d_name,"..")==0) continue;
+        if (strcmp(e->d_name,".git")==0) continue;
+        if (strcmp(e->d_name,"build")==0) continue;
+        if (strcmp(e->d_name,"build-linux")==0) continue;
+        char child[PATH_MAX];
+        if (strcmp(base,".")==0) snprintf(child,sizeof(child),"%s",e->d_name);
+        else snprintf(child,sizeof(child),"%s/%s",base,e->d_name);
+        struct stat cs;
+        if (lstat(child,&cs)==0 && S_ISDIR(cs.st_mode)) fg_add_expand(child,out,cnt,cap);
+        else fg_add_push(out,cnt,cap,child);
+    }
+    closedir(d);
+}
 
 int fastgit_cmd_add(int argc, char **argv) {
     if (argc < 1) {
@@ -33,25 +63,31 @@ int fastgit_cmd_add(int argc, char **argv) {
         paths[npaths++] = p;
     }
     if (npaths == 0) { free((void*)paths); fastgit_repository_free(repo); fprintf(stderr, "nothing specified\n"); return 1; }
-    if (npaths > 1) {
-        err = fastgit_index_add_many(idx, paths, npaths);
+    // expand directories (git add . parity)
+    char **exp = NULL; size_t exp_cnt=0, exp_cap=0;
+    for (size_t i=0;i<npaths;i++) fg_add_expand(paths[i], &exp, &exp_cnt, &exp_cap);
+    free((void*)paths);
+    if (exp_cnt == 0) { free(exp); fastgit_repository_free(repo); fprintf(stderr, "nothing to add\n"); return 1; }
+    if (exp_cnt > 1) {
+        err = fastgit_index_add_many(idx, (const char**)exp, exp_cnt);
         if (err != FASTGIT_OK) {
             fprintf(stderr, "error: add failed: %s\n", fastgit_error_string(err));
+            for(size_t i=0;i<exp_cnt;i++) free(exp[i]); free(exp);
             fastgit_repository_free(repo);
             return 1;
         }
     } else {
-        for (size_t i = 0; i < npaths; i++) {
-            err = fastgit_index_add(idx, paths[i]);
+        for (size_t i = 0; i < exp_cnt; i++) {
+            err = fastgit_index_add(idx, exp[i]);
             if (err != FASTGIT_OK) {
-                fprintf(stderr, "error: pathspec '%s' did not match any files: %s\n", paths[i], fastgit_error_string(err));
-                free((void*)paths);
+                fprintf(stderr, "error: pathspec '%s' did not match any files: %s\n", exp[i], fastgit_error_string(err));
+                for(size_t k=0;k<exp_cnt;k++) free(exp[k]); free(exp);
                 fastgit_repository_free(repo);
                 return 1;
             }
         }
     }
-    free((void*)paths);
+    for(size_t i=0;i<exp_cnt;i++) free(exp[i]); free(exp);
     err = fastgit_index_write(idx);
     if (err != FASTGIT_OK) {
         fprintf(stderr, "error: could not write index: %s\n", fastgit_error_string(err));
