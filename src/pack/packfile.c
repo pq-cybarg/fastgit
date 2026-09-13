@@ -1,5 +1,7 @@
 #include "fastgit/pack.h"
 #include "fastgit/hash.h"
+#include "fastgit/platform.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -392,6 +394,93 @@ fastgit_error_t fastgit_pack_add_object(fastgit_pack_t* p,fastgit_obj_type_t t,c
     p->header.object_count++;
     p->stats_objects_written++; p->stats_bytes_written+=l;
     return FASTGIT_OK;
+}
+typedef struct { fastgit_pack_t* p; fastgit_obj_type_t t; const void* d; size_t l; fastgit_oid_t oid; uint8_t hdr[16]; size_t hlen; uint8_t* comp; uLongf clen; uint32_t crc; fastgit_error_t err; } pack_par_task_t;
+static void pack_par_fn(void* arg){
+    pack_par_task_t* tk=(pack_par_task_t*)arg;
+    if(oid_of_object(tk->t, tk->d, tk->l, &tk->oid)!=FASTGIT_OK){ tk->err=FASTGIT_EIO; return; }
+    uint32_t ptype=FASTGIT_PACK_OBJ_BLOB;
+    if(tk->t==FASTGIT_OBJ_COMMIT) ptype=FASTGIT_PACK_OBJ_COMMIT;
+    else if(tk->t==FASTGIT_OBJ_TREE) ptype=FASTGIT_PACK_OBJ_TREE;
+    else if(tk->t==FASTGIT_OBJ_TAG) ptype=FASTGIT_PACK_OBJ_TAG;
+    tk->hlen=encode_pack_header(ptype, tk->l, tk->hdr);
+    tk->clen=compressBound(tk->l);
+    tk->comp=malloc(tk->clen); if(!tk->comp){ tk->err=FASTGIT_ENOMEM; return; }
+    int z=compress2(tk->comp, &tk->clen, tk->d, tk->l, Z_BEST_SPEED);
+    if(z!=Z_OK){ free(tk->comp); tk->comp=NULL; tk->err=FASTGIT_EIO; return; }
+    uint32_t crc=crc32(0L,Z_NULL,0); crc=crc32(crc,tk->hdr,tk->hlen); crc=crc32(crc,tk->comp,tk->clen);
+    tk->crc=crc; tk->err=FASTGIT_OK;
+}
+fastgit_error_t fastgit_pack_add_objects_parallel(fastgit_pack_t* p, fastgit_obj_type_t* types, const void** datas, size_t* lens, size_t count, fastgit_oid_t* oids_out){
+    if(!p||!datas||!lens||count==0) return FASTGIT_EINVAL;
+    if(!p->writing) return FASTGIT_EINVAL;
+    if(ensure_write_cap(p)!=FASTGIT_OK) return FASTGIT_ENOMEM;
+    // small batches: use sequential to avoid thread overhead
+    if(count<128){
+        for(size_t i=0;i<count;i++){
+            fastgit_obj_type_t t= types?types[i]:FASTGIT_OBJ_BLOB;
+            fastgit_oid_t oid; fastgit_error_t e=fastgit_pack_add_object(p,t,datas[i],lens[i],&oid);
+            if(e!=FASTGIT_OK) return e;
+            if(oids_out) oids_out[i]=oid;
+        }
+        return FASTGIT_OK;
+    }
+    pack_par_task_t* tasks=calloc(count,sizeof(*tasks));
+    if(!tasks) return FASTGIT_ENOMEM;
+    for(size_t i=0;i<count;i++){ tasks[i].p=p; tasks[i].t= types?types[i]:FASTGIT_OBJ_BLOB; tasks[i].d=datas[i]; tasks[i].l=lens[i]; }
+    fastgit_thread_pool_config_t cfg={0}; cfg.worker_count=8; cfg.max_queue_depth=(int)(count+16);
+    fastgit_thread_pool_t* pool=NULL; fastgit_error_t pe=fastgit_thread_pool_new(&cfg,&pool);
+    bool use_pool=(pe==FASTGIT_OK && pool!=NULL);
+    if(use_pool){
+        for(size_t i=0;i<count;i++){
+            // retry on EBUSY with brief yield
+            while(1){
+                fastgit_error_t se=fastgit_thread_pool_submit(pool, pack_par_fn, &tasks[i]);
+                if(se==FASTGIT_OK) break;
+                if(se!=FASTGIT_EBUSY){ pe=se; break; }
+                struct timespec ts={0,500000}; nanosleep(&ts,NULL);
+            }
+            if(pe!=FASTGIT_OK) break;
+        }
+        if(pe==FASTGIT_OK) pe=fastgit_thread_pool_wait(pool);
+        fastgit_thread_pool_free(pool);
+        if(pe!=FASTGIT_OK){
+            for(size_t i=0;i<count;i++) free(tasks[i].comp);
+            free(tasks); return pe;
+        }
+        // check per-task errors and sequential write in order
+        for(size_t i=0;i<count;i++){
+            if(tasks[i].err!=FASTGIT_OK){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return tasks[i].err; }
+        }
+        for(size_t i=0;i<count;i++){
+            uint64_t off=p->w_cur_offset;
+            if(write(p->fd,tasks[i].hdr,tasks[i].hlen)!=(ssize_t)tasks[i].hlen){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return FASTGIT_EIO; }
+            if(write(p->fd,tasks[i].comp,tasks[i].clen)!=(ssize_t)tasks[i].clen){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return FASTGIT_EIO; }
+            if(ensure_write_cap(p)!=FASTGIT_OK){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return FASTGIT_ENOMEM; }
+            p->w_oids[p->w_count]=tasks[i].oid;
+            p->w_crcs[p->w_count]=tasks[i].crc;
+            p->w_offsets[p->w_count]=off;
+            p->w_count++; p->w_cur_offset+=tasks[i].hlen+tasks[i].clen;
+            p->header.object_count++; p->stats_objects_written++; p->stats_bytes_written+=tasks[i].l;
+            if(oids_out) oids_out[i]=tasks[i].oid;
+            free(tasks[i].comp);
+        }
+        free(tasks);
+        return FASTGIT_OK;
+    } else {
+        // fallback sequential compress then write
+        for(size_t i=0;i<count;i++){ pack_par_fn(&tasks[i]); if(tasks[i].err!=FASTGIT_OK){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return tasks[i].err; } }
+        for(size_t i=0;i<count;i++){
+            uint64_t off=p->w_cur_offset;
+            if(write(p->fd,tasks[i].hdr,tasks[i].hlen)!=(ssize_t)tasks[i].hlen){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return FASTGIT_EIO; }
+            if(write(p->fd,tasks[i].comp,tasks[i].clen)!=(ssize_t)tasks[i].clen){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return FASTGIT_EIO; }
+            if(ensure_write_cap(p)!=FASTGIT_OK){ for(size_t j=0;j<count;j++) free(tasks[j].comp); free(tasks); return FASTGIT_ENOMEM; }
+            p->w_oids[p->w_count]=tasks[i].oid; p->w_crcs[p->w_count]=tasks[i].crc; p->w_offsets[p->w_count]=off;
+            p->w_count++; p->w_cur_offset+=tasks[i].hlen+tasks[i].clen; p->header.object_count++; p->stats_objects_written++; p->stats_bytes_written+=tasks[i].l;
+            if(oids_out) oids_out[i]=tasks[i].oid; free(tasks[i].comp);
+        }
+        free(tasks); return FASTGIT_OK;
+    }
 }
 fastgit_error_t fastgit_pack_write(fastgit_pack_t* p,const fastgit_oid_t* o,size_t c){ (void)o;(void)c; if(!p) return FASTGIT_EINVAL; if(!p->writing) return FASTGIT_EINVAL; return FASTGIT_OK; }
 fastgit_error_t fastgit_pack_index_load(const char* idx_file,fastgit_pack_index_t** out){

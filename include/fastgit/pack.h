@@ -58,6 +58,7 @@ fastgit_error_t fastgit_pack_exists(fastgit_pack_t* pack, const fastgit_oid_t* o
 
 fastgit_error_t fastgit_pack_write(fastgit_pack_t* pack, const fastgit_oid_t* objects, size_t count);
 fastgit_error_t fastgit_pack_add_object(fastgit_pack_t* pack, fastgit_obj_type_t type, const void* data, size_t len, fastgit_oid_t* out);
+fastgit_error_t fastgit_pack_add_objects_parallel(fastgit_pack_t* pack, fastgit_obj_type_t* types, const void** datas, size_t* lens, size_t count, fastgit_oid_t* oids_out);
 
 fastgit_error_t fastgit_pack_index_load(const char* idx_file, fastgit_pack_index_t** out);
 fastgit_error_t fastgit_pack_index_create(const char* idx_file, fastgit_pack_t* pack);

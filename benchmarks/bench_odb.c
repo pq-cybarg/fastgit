@@ -92,11 +92,16 @@ int main(void) {
         char pd[1024]; snprintf(pd, sizeof(pd), "%s/pack", dir); mkdir(pd, 0755);
         clock_gettime(CLOCK_MONOTONIC, &start);
         if (fastgit_pack_create(pack_path, idx_path, &pk) == FASTGIT_OK) {
-            for (int i = 0; i < ITERATIONS; i++) {
-                data[0] = (char)(i & 0xFF); data[1] = (char)((i>>8)&0xFF);
-                data[2] = (char)((i>>16)&0xFF); data[3] = (char)((i>>24)&0xFF);
-                fastgit_oid_t dummy; (void)fastgit_pack_add_object(pk, FASTGIT_OBJ_BLOB, data, 1024, &dummy);
+            // use parallel batch for baremetal throughput (distinct buffers)
+            const void** pdatas = malloc(ITERATIONS*sizeof(void*));
+            size_t* plens = malloc(ITERATIONS*sizeof(size_t));
+            uint8_t** pbufs = malloc(ITERATIONS*sizeof(uint8_t*));
+            for(int i=0;i<ITERATIONS;i++){ pbufs[i]=malloc(1024); memcpy(pbufs[i],data,1024); pbufs[i][0]=(uint8_t)(i&0xFF); pbufs[i][1]=(uint8_t)((i>>8)&0xFF); pbufs[i][2]=(uint8_t)((i>>16)&0xFF); pbufs[i][3]=(uint8_t)((i>>24)&0xFF); pdatas[i]=pbufs[i]; plens[i]=1024; }
+            fastgit_error_t pe = fastgit_pack_add_objects_parallel(pk, NULL, pdatas, plens, ITERATIONS, NULL);
+            if(pe!=FASTGIT_OK){
+                for (int i = 0; i < ITERATIONS; i++) { fastgit_oid_t dummy; (void)fastgit_pack_add_object(pk, FASTGIT_OBJ_BLOB, pdatas[i], 1024, &dummy); }
             }
+            for(int i=0;i<ITERATIONS;i++) free(pbufs[i]); free(pbufs); free(pdatas); free(plens);
             fastgit_pack_close(pk);
         }
         clock_gettime(CLOCK_MONOTONIC, &end);
