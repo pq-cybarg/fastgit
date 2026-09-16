@@ -259,3 +259,138 @@ int fastgit_cmd_verify(int argc, char **argv) {
     }
     fastgit_repository_free(repo); return errors ? 1 : 0;
 }
+
+int fastgit_cmd_commit_graph(int argc, char **argv) {
+    const char* sub = argc >= 1 ? argv[0] : "write";
+    fastgit_repository_t* repo = NULL;
+    if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+    fastgit_error_t err = FASTGIT_EUNSUPPORTED;
+    if (strcmp(sub, "write") == 0) {
+        err = fastgit_commit_graph_write(repo);
+        if (err == FASTGIT_OK) printf("commit-graph written\n");
+    } else if (strcmp(sub, "read") == 0) {
+        fastgit_commit_graph_t* cg = NULL;
+        err = fastgit_commit_graph_read(repo, &cg);
+        if (err == FASTGIT_OK) {
+            printf("commit-graph: %zu commits\n", cg->count);
+            fastgit_commit_graph_free(cg);
+        }
+    } else if (strcmp(sub, "verify") == 0) {
+        fastgit_commit_graph_t* cg = NULL;
+        err = fastgit_commit_graph_read(repo, &cg);
+        if (err == FASTGIT_OK) {
+            printf("commit-graph verified: %zu commits\n", cg->count);
+            fastgit_commit_graph_free(cg);
+        }
+    } else {
+        fprintf(stderr, "usage: fastgit commit-graph <write|read|verify>\n");
+        err = FASTGIT_EINVAL;
+    }
+    fastgit_repository_free(repo);
+    return err == FASTGIT_OK ? 0 : 1;
+}
+
+int fastgit_cmd_replace(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "usage: fastgit replace <create|list> <name> [<oid>]\n"); return 1; }
+    const char* sub = argv[0];
+    fastgit_repository_t* repo = NULL;
+    if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+    fastgit_error_t err = FASTGIT_EUNSUPPORTED;
+    if (strcmp(sub, "create") == 0 && argc >= 3) {
+        fastgit_oid_t oid;
+        if (fastgit_oid_from_hex(argv[2], &oid) != FASTGIT_OK) { fprintf(stderr, "invalid oid\n"); fastgit_repository_free(repo); return 1; }
+        err = fastgit_replace_ref_create(repo, argv[1], &oid, true);
+        if (err == FASTGIT_OK) printf("replace ref created: %s\n", argv[1]);
+    } else if (strcmp(sub, "list") == 0) {
+        char** list = NULL; size_t cnt = 0;
+        err = fastgit_replace_ref_list(repo, &list, &cnt);
+        if (err == FASTGIT_OK) {
+            for (size_t i = 0; i < cnt; i++) printf("%s\n", list[i]);
+            for (size_t i = 0; i < cnt; i++) free(list[i]);
+            free(list);
+        }
+    } else {
+        fprintf(stderr, "usage: fastgit replace <create|list> <name> [<oid>]\n");
+        err = FASTGIT_EINVAL;
+    }
+    fastgit_repository_free(repo);
+    return err == FASTGIT_OK ? 0 : 1;
+}
+
+int fastgit_cmd_submodule(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "usage: fastgit submodule <add|init|update|foreach|status> [<args>...]\n"); return 1; }
+    const char* sub = argv[0];
+    fastgit_repository_t* repo = NULL;
+    if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+    fastgit_error_t err = FASTGIT_EUNSUPPORTED;
+    if (strcmp(sub, "add") == 0 && argc >= 4) {
+        err = fastgit_submodule_add(repo, argv[1], argv[2], argv[3]);
+        if (err == FASTGIT_OK) printf("submodule added: %s\n", argv[1]);
+    } else if (strcmp(sub, "init") == 0) {
+        err = fastgit_submodule_init(repo, NULL);
+        if (err == FASTGIT_OK) printf("submodules initialized\n");
+    } else if (strcmp(sub, "update") == 0) {
+        err = fastgit_submodule_update(repo, NULL, true);
+        if (err == FASTGIT_OK) printf("submodules updated\n");
+    } else if (strcmp(sub, "foreach") == 0) {
+        if (argc >= 2) {
+            err = fastgit_submodule_foreach(repo, NULL, argv[1]);
+        } else {
+            fprintf(stderr, "usage: fastgit submodule foreach <command>\n");
+            err = FASTGIT_EINVAL;
+        }
+    } else if (strcmp(sub, "status") == 0) {
+        fastgit_submodule_info_t** info = NULL;
+        size_t cnt = 0;
+        err = fastgit_submodule_status(repo, &info, &cnt);
+        if (err == FASTGIT_OK) {
+            for (size_t i = 0; i < cnt; i++) {
+                printf("%s %s\n", info[i]->name, info[i]->path);
+            }
+            fastgit_submodule_info_free(info, cnt);
+        }
+    } else {
+        fprintf(stderr, "usage: fastgit submodule <add|init|update|foreach|status> [<args>...]\n");
+        err = FASTGIT_EINVAL;
+    }
+    fastgit_repository_free(repo);
+    return err == FASTGIT_OK ? 0 : 1;
+}
+
+int fastgit_cmd_lfs(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "usage: fastgit lfs <check|pointer> [<file>]\n"); return 1; }
+    const char* sub = argv[0];
+    if (strcmp(sub, "check") == 0 && argc >= 2) {
+        FILE* f = fopen(argv[1], "rb");
+        if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        size_t len = sz > 0 ? (size_t)sz : 0;
+        void* data = malloc(len + 1);
+        if (len) fread(data, 1, len, f);
+        ((char*)data)[len] = '\0';
+        fclose(f);
+        fastgit_lfs_pointer_t ptr;
+        fastgit_error_t err = fastgit_lfs_pointer_detect(data, len, &ptr);
+        free(data);
+        if (err == FASTGIT_OK && ptr.is_lfs) {
+            printf("%s is LFS pointer (oid=%s size=%llu)\n", argv[1], ptr.oid, (unsigned long long)ptr.size);
+            return 0;
+        } else {
+            printf("%s is not an LFS pointer\n", argv[1]);
+            return 1;
+        }
+    } else if (strcmp(sub, "pointer") == 0 && argc >= 3) {
+        char* ptr_str;
+        size_t ptr_len;
+        fastgit_error_t err = fastgit_lfs_pointer_create(argv[1], strtoull(argv[2], NULL, 10), &ptr_str, &ptr_len);
+        if (err == FASTGIT_OK) {
+            printf("%s", ptr_str);
+            free(ptr_str);
+            return 0;
+        }
+        return 1;
+    } else {
+        fprintf(stderr, "usage: fastgit lfs <check|pointer> [<file>|<oid> <size>]\n");
+        return 1;
+    }
+}

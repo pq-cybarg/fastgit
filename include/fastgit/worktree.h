@@ -79,6 +79,21 @@ typedef struct {
 
 fastgit_error_t fastgit_diff_worktree_ext(fastgit_worktree_t* wt, const char* path, const fastgit_diff_options_t* opts, char** out);
 
+// Multi-worktree management
+typedef struct {
+    char* path;
+    char* gitdir;
+    char* head_ref;
+    bool is_bare;
+    bool is_detached;
+} fastgit_worktree_info_t;
+
+fastgit_error_t fastgit_worktree_add(fastgit_repository_t* repo, const char* path, const char* refspec);
+fastgit_error_t fastgit_worktree_remove(fastgit_repository_t* repo, const char* path, bool force);
+fastgit_error_t fastgit_worktree_list(fastgit_repository_t* repo, fastgit_worktree_info_t*** out_info, size_t* count);
+fastgit_error_t fastgit_worktree_prune(fastgit_repository_t* repo, bool dry_run);
+void fastgit_worktree_info_free(fastgit_worktree_info_t** info, size_t count);
+
 #ifdef __cplusplus
 }
 #endif

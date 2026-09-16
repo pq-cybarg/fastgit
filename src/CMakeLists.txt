@@ -11,6 +11,7 @@ set(FASTGIT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/object/tree.c
     ${CMAKE_CURRENT_SOURCE_DIR}/object/commit.c
     ${CMAKE_CURRENT_SOURCE_DIR}/object/tag.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/object/commit_graph.c
     ${CMAKE_CURRENT_SOURCE_DIR}/odb/odb.c
     ${CMAKE_CURRENT_SOURCE_DIR}/odb/loose.c
     ${CMAKE_CURRENT_SOURCE_DIR}/pack/packfile.c
@@ -26,6 +27,8 @@ set(FASTGIT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/network/smart_http.c
     ${CMAKE_CURRENT_SOURCE_DIR}/network/ssh.c
     ${CMAKE_CURRENT_SOURCE_DIR}/network/pqc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bundle/bundle.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/submodule/submodule.c
     ${CMAKE_CURRENT_SOURCE_DIR}/merge/merge.c
     ${CMAKE_CURRENT_SOURCE_DIR}/merge/rebase.c
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/platform.c

@@ -571,3 +571,76 @@ fastgit_error_t fastgit_clone(const char* url, const char* path, const char* ref
     }
     return FASTGIT_EUNSUPPORTED;
 }
+
+// Replace refs
+static fastgit_error_t replace_path_for_name(fastgit_repository_t* repo, const char* name, char* out, size_t out_len) {
+    if (!repo || !name || !out) return FASTGIT_EINVAL;
+    if (strncmp(name, "refs/replace/", 13)==0) snprintf(out, out_len, "%s/%s", repo->gitdir, name);
+    else snprintf(out, out_len, "%s/refs/replace/%s", repo->gitdir, name);
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_replace_ref_create(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* oid, bool force) {
+    if (!repo || !name || !oid) return FASTGIT_EINVAL;
+    char path[4096];
+    replace_path_for_name(repo, name, path, sizeof(path));
+    if (!force) {
+        struct stat st;
+        if (stat(path, &st) == 0) return FASTGIT_EEXIST;
+    }
+    ensure_ref_dir(path);
+    char hex[129] = {0};
+    fastgit_oid_to_hex(oid, hex, sizeof(hex));
+    FILE* f = fopen(path, "w");
+    if (!f) return FASTGIT_EIO;
+    fprintf(f, "%s\n", hex);
+    fclose(f);
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_replace_ref_lookup(fastgit_repository_t* repo, const char* name, fastgit_oid_t* out) {
+    if (!repo || !name || !out) return FASTGIT_EINVAL;
+    char path[4096];
+    replace_path_for_name(repo, name, path, sizeof(path));
+    char hex[129] = {0};
+    FILE* f = fopen(path, "r");
+    if (!f) return FASTGIT_ENOENT;
+    if (!fgets(hex, sizeof(hex), f)) { fclose(f); return FASTGIT_EIO; }
+    fclose(f);
+    size_t l = strlen(hex);
+    while (l > 0 && (hex[l-1]=='\n' || hex[l-1]=='\r')) hex[--l] = 0;
+    return fastgit_oid_from_hex(hex, out);
+}
+
+fastgit_error_t fastgit_replace_ref_list(fastgit_repository_t* repo, char*** out, size_t* count) {
+    if (!repo || !out || !count) return FASTGIT_EINVAL;
+    *out = NULL; *count = 0;
+    char base[4096];
+    snprintf(base, sizeof(base), "%s/refs/replace", repo->gitdir);
+    DIR* d = opendir(base);
+    if (!d) return FASTGIT_OK;
+    char** list = NULL;
+    size_t cnt = 0, cap = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (strcmp(e->d_name, ".")==0 || strcmp(e->d_name, "..")==0) continue;
+        if (*count >= cap) { cap = cap ? cap*2 : 16; list = realloc(list, cap*sizeof(char*)); }
+        char full[4096]; snprintf(full, sizeof(full), "refs/replace/%s", e->d_name);
+        list[(*count)++] = strdup(full);
+    }
+    closedir(d);
+    *out = list;
+    *count = cnt;
+    return FASTGIT_OK;
+}
+
+// Shallow fetch/clone
+fastgit_error_t fastgit_fetch_shallow(fastgit_repository_t* repo, const char* remote, const char* refspec, int depth) {
+    (void)depth; // TODO: implement shallow fetch with depth
+    return fastgit_fetch(repo, remote, refspec);
+}
+
+fastgit_error_t fastgit_clone_shallow(const char* url, const char* path, const char* ref, int depth) {
+    (void)depth; // TODO: implement shallow clone with depth
+    return fastgit_clone(url, path, ref);
+}

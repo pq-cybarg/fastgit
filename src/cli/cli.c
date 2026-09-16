@@ -53,6 +53,12 @@ int fastgit_cmd_verify(int argc, char **argv);
 int fastgit_cmd_benchmark(int argc, char **argv);
 int fastgit_cmd_stats(int argc, char **argv);
 int fastgit_cmd_config(int argc, char **argv);
+int fastgit_cmd_bundle(int argc, char **argv);
+int fastgit_cmd_worktree(int argc, char **argv);
+int fastgit_cmd_commit_graph(int argc, char **argv);
+int fastgit_cmd_replace(int argc, char **argv);
+int fastgit_cmd_submodule(int argc, char **argv);
+int fastgit_cmd_lfs(int argc, char **argv);
 
 static const fastgit_cmd_def_t builtin_commands[] = {
     { "init", "init", "Create an empty Git repository", FASTGIT_CMD_INIT, 0, 1, "[<directory>]", fastgit_cmd_init },
@@ -93,6 +99,12 @@ static const fastgit_cmd_def_t builtin_commands[] = {
     { "migrate", "migrate", "Migrate repository to different hash algorithm", FASTGIT_CMD_MIGRATE, 0, -1, "<algorithm>", fastgit_cmd_migrate },
     { "verify", "verify", "Verify repository integrity", FASTGIT_CMD_VERIFY, 0, -1, "[<options>]", fastgit_cmd_verify },
     { "version", "version", "Show version information", FASTGIT_CMD_VERSION, 0, 0, "", fastgit_cmd_version },
+    { "bundle", "bundle", "Move objects and refs by archive", FASTGIT_CMD_BUNDLE, 0, -1, "<subcommand>...", fastgit_cmd_bundle },
+    { "worktree", "worktree", "Manage multiple working trees", FASTGIT_CMD_WORKTREE, 0, -1, "<subcommand>...", fastgit_cmd_worktree },
+    { "commit-graph", "commit-graph", "Write and verify commit-graph files", FASTGIT_CMD_COMMIT_GRAPH, 0, -1, "<write|read|verify>", fastgit_cmd_commit_graph },
+    { "replace", "replace", "Create, list, delete refs to replace objects", FASTGIT_CMD_REPLACE, 0, -1, "<create|list> <name> [<oid>]", fastgit_cmd_replace },
+    { "submodule", "submodule", "Initialize, update and inspect submodules", FASTGIT_CMD_SUBMODULE, 0, -1, "<add|init|update|foreach|status> [<args>...]", fastgit_cmd_submodule },
+    { "lfs", "lfs", "Git LFS pointer file handling", FASTGIT_CMD_LFS, 0, -1, "<check|pointer> [<file>]", fastgit_cmd_lfs },
 };
 
 static size_t builtin_count = sizeof(builtin_commands) / sizeof(builtin_commands[0]);

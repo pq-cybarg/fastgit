@@ -29,7 +29,7 @@ Scope: nothing is out of scope. v0.2 ships loose ODB + index + hash (see §9); p
 | `hash-object` (SHA-256) | ~1.8 GB/s | OpenSSL EVP `__thread` reuse (`FASTGIT_HAVE_OPENSSL=1`), 51ms/100k×1KB; `openssl speed sha256 -bytes 1024` ~2.0 GB/s |
 | ODB write (hot cache, same blob) | ~1.18M ops/s | 16K 8-probe cache hit, no serialize/write (8.4ms/10k) |
 | ODB write (durable distinct) | ~5.6k ops/s | `tmp.<pid> + fsync + rename + dir fsync` per loose `ab/cdef` (1762ms/10k crash-safe; `O_TRUNC` → `O_EXCL` fix) |
-| ODB write (pack batch, 10k/pack) | ~36k ops/s | single `pack-*.pack + .idx` `1 fsync` amortized (273ms/10k) |
+| ODB write (pack batch, 10k/pack) | ~36k ops/s | single `pack-*.pack + .idx` `1 fsync` amortized (277ms/10k) |
 | ODB read (hot / distinct) | ~16M / ~2.4M ops/s | cache vs loose zlib inflate; `pack mmap` ~1.0M |
 | `add` 1000 files (durable, bulk) | ~23k ops/s | `index_add_many` Git-shaped `blob header + odb_write + replace (path,stage)` parallel + `add .` directory recursion; `bench_full` 42ms/1000 (`~20×` vs `git add ~1.1k`) |
 | index add (bench_index, in-memory) | ~2.0M ops/s | `fastgit_index_add_from_buffer` in-memory via FNV-1a HT (4.8ms/10k); durable `add .` above |

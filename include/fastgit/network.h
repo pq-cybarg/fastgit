@@ -69,6 +69,7 @@ const char* fastgit_remote_url(fastgit_remote_t* remote);
 fastgit_error_t fastgit_remote_set_cred_callbacks(fastgit_remote_t* remote, const fastgit_cred_callbacks_t* callbacks);
 
 fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, const char* refspec);
+fastgit_error_t fastgit_fetch_remote(fastgit_repository_t* repo, fastgit_remote_t* remote, const char* refspec);
 fastgit_error_t fastgit_push(fastgit_repository_t* repo, const char* remote, const char* refspec);
 
 typedef struct {
@@ -148,10 +149,39 @@ typedef struct {
     uint32_t shed_threshold_pct;
 } fastgit_load_shed_t;
 
+typedef enum {
+    FASTGIT_FILTER_NONE = 0,
+    FASTGIT_FILTER_BLOB_NONE = 1,
+    FASTGIT_FILTER_BLOB_LIMIT = 2,
+    FASTGIT_FILTER_TREE_DEPTH = 3,
+    FASTGIT_FILTER_COMBINE = 4,
+} fastgit_filter_type_t;
+
+typedef struct {
+    fastgit_filter_type_t type;
+    union {
+        struct {
+            uint64_t max_size;
+        } blob_limit;
+        struct {
+            uint32_t depth;
+        } tree_depth;
+    };
+} fastgit_filter_spec_t;
+
+typedef struct {
+    fastgit_filter_spec_t* specs;
+    size_t count;
+} fastgit_filter_list_t;
+
 fastgit_error_t fastgit_remote_set_pqc_config(fastgit_remote_t* remote, const fastgit_pqc_config_t* config);
 fastgit_error_t fastgit_remote_set_retry_policy(fastgit_remote_t* remote, const fastgit_retry_policy_t* policy);
 fastgit_error_t fastgit_remote_set_circuit_breaker(fastgit_remote_t* remote, const fastgit_circuit_breaker_t* cb);
 fastgit_error_t fastgit_remote_set_load_shed(fastgit_remote_t* remote, const fastgit_load_shed_t* ls);
+
+fastgit_error_t fastgit_remote_set_filter(fastgit_remote_t* remote, const fastgit_filter_list_t* filter);
+fastgit_error_t fastgit_filter_list_append(fastgit_filter_list_t* list, const fastgit_filter_spec_t* spec);
+void fastgit_filter_list_free(fastgit_filter_list_t* list);
 
 // pkt-line parser (smart HTTP/SSH refs advertisement) — protocol.c
 fastgit_error_t fastgit_pktline_parse_refs(const char* buf, size_t len, fastgit_ref_t*** out_refs, size_t* out_count);

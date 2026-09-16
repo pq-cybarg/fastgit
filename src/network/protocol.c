@@ -26,6 +26,8 @@ struct fastgit_remote {
     fastgit_retry_policy_t retry;
     fastgit_circuit_breaker_t cb;
     fastgit_load_shed_t ls;
+    fastgit_filter_spec_t* filter;
+    size_t filter_count;
     uint32_t retry_budget_remaining;
     uint64_t retry_budget_reset_ms;
     uint64_t cb_open_until_ms;
@@ -160,6 +162,8 @@ fastgit_error_t fastgit_remote_create(fastgit_repository_t* repo, const char* na
     remote->ls.max_concurrent = 64;
     remote->ls.queue_depth = 256;
     remote->ls.shed_threshold_pct = 90;
+    remote->filter = NULL;
+    remote->filter_count = 0;
     *out = remote;
     return FASTGIT_OK;
 }
@@ -207,6 +211,9 @@ void fastgit_remote_free(fastgit_remote_t* remote) {
     if (!remote) return;
     free(remote->name);
     free(remote->url);
+    if (remote->filter) {
+        free(remote->filter);
+    }
     free(remote);
 }
 
@@ -428,7 +435,7 @@ static void pktline_append(char** buf, size_t* len, size_t* cap, const char* pay
 }
 
 static char* build_fetch_request(fastgit_ref_t** remote_refs, size_t remote_count,
-                                 fastgit_repository_t* repo, size_t* out_len) {
+                                 fastgit_repository_t* repo, fastgit_remote_t* remote, size_t* out_len) {
     (void)remote_count;
     char* buf = NULL; size_t len = 0, cap = 0;
     // want all remote refs (30x: fetch batch; filter via repository remote refs if needed)
@@ -437,7 +444,25 @@ static char* build_fetch_request(fastgit_ref_t** remote_refs, size_t remote_coun
         char hex[129]; fastgit_oid_to_hex(&remote_refs[i]->oid, hex, sizeof(hex));
         char line[2048];
         if (first) {
-            snprintf(line, sizeof(line), "want %s thin-pack ofs-delta side-band side-band-64k agent=fastgit/0.1.0\n", hex);
+            // Include filter capabilities if any
+            char filter_str[2048] = {0};
+            if (remote && remote->filter_count > 0) {
+                for (size_t f = 0; f < remote->filter_count; f++) {
+                    const fastgit_filter_spec_t* fs = &remote->filter[f];
+                    if (fs->type == FASTGIT_FILTER_BLOB_NONE) {
+                        strcat(filter_str, " filter=blob:none");
+                    } else if (fs->type == FASTGIT_FILTER_BLOB_LIMIT) {
+                        char buf2[256];
+                        snprintf(buf2, sizeof(buf2), " filter=blob:limit=%llu", (unsigned long long)fs->blob_limit.max_size);
+                        strcat(filter_str, buf2);
+                    } else if (fs->type == FASTGIT_FILTER_TREE_DEPTH) {
+                        char buf2[256];
+                        snprintf(buf2, sizeof(buf2), " filter=tree:%u", fs->tree_depth.depth);
+                        strcat(filter_str, buf2);
+                    }
+                }
+            }
+            snprintf(line, sizeof(line), "want %s thin-pack ofs-delta side-band side-band-64k agent=fastgit/0.1.0%s\n", hex, filter_str);
             first = false;
         } else {
             snprintf(line, sizeof(line), "want %s\n", hex);
@@ -811,15 +836,11 @@ static fastgit_error_t fetch_via_file(fastgit_repository_t* repo, const char* re
     return FASTGIT_OK;
 }
 
-fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, const char* refspec) {
+static fastgit_error_t fastgit_fetch_internal(fastgit_repository_t* repo, fastgit_remote_t* r, const char* refspec) {
     (void)refspec;
-    if (!repo || !remote) return FASTGIT_EINVAL;
-    fastgit_remote_t* r = NULL;
-    fastgit_error_t err = fastgit_remote_lookup(repo, remote, &r);
-    if (err != FASTGIT_OK) err = fastgit_remote_create(repo, remote, remote, &r);
-    if (err != FASTGIT_OK) return err;
-    if (!fastgit_remote_circuit_allow(r)) { fastgit_remote_free(r); return FASTGIT_EBUSY; }
-    if (!fastgit_remote_load_acquire(r)) { fastgit_remote_free(r); return FASTGIT_EBUSY; }
+    if (!repo || !r) return FASTGIT_EINVAL;
+    if (!fastgit_remote_circuit_allow(r)) return FASTGIT_EBUSY;
+    if (!fastgit_remote_load_acquire(r)) return FASTGIT_EBUSY;
     bool queued = r->ls_queued > 0;
     fastgit_error_t last = FASTGIT_EUNSUPPORTED;
       if (is_file_url(r->url)) {
@@ -837,7 +858,7 @@ fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, co
                 fastgit_error_t pe = fastgit_pktline_parse_refs(rdata, rlen, &remote_refs, &rcount);
                 if (pe == FASTGIT_OK && rcount > 0) {
                     size_t req_len = 0;
-                    char* req = build_fetch_request(remote_refs, rcount, repo, &req_len);
+                    char* req = build_fetch_request(remote_refs, rcount, repo, r, &req_len);
                     fastgit_remote_ls_free(remote_refs, rcount);
                     if (req && req_len > 0) {
                         fastgit_error_t pe2 = fastgit_http_post_upload_pack(t, req, req_len);
@@ -876,7 +897,7 @@ fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, co
                 fastgit_error_t pe = fastgit_pktline_parse_refs(rdata, rlen, &remote_refs, &rcount);
                 if (pe == FASTGIT_OK && rcount > 0) {
                     size_t req_len = 0;
-                    char* req = build_fetch_request(remote_refs, rcount, repo, &req_len);
+                    char* req = build_fetch_request(remote_refs, rcount, repo, r, &req_len);
                     fastgit_remote_ls_free(remote_refs, rcount);
                     if (req && req_len > 0) {
                         fastgit_error_t we = fastgit_ssh_channel_write(t, req, req_len);
@@ -919,8 +940,23 @@ fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, co
     if (last == FASTGIT_OK) fastgit_remote_circuit_on_success(r);
     else if (fastgit_error_is_retryable(last)) fastgit_remote_circuit_on_failure(r);
     fastgit_remote_load_release(r, queued);
-    fastgit_remote_free(r);
     return last;
+}
+
+fastgit_error_t fastgit_fetch(fastgit_repository_t* repo, const char* remote, const char* refspec) {
+    if (!repo || !remote) return FASTGIT_EINVAL;
+    fastgit_remote_t* r = NULL;
+    fastgit_error_t err = fastgit_remote_lookup(repo, remote, &r);
+    if (err != FASTGIT_OK) err = fastgit_remote_create(repo, remote, remote, &r);
+    if (err != FASTGIT_OK) return err;
+    fastgit_error_t ret = fastgit_fetch_internal(repo, r, refspec);
+    fastgit_remote_free(r);
+    return ret;
+}
+
+fastgit_error_t fastgit_fetch_remote(fastgit_repository_t* repo, fastgit_remote_t* remote, const char* refspec) {
+    if (!repo || !remote) return FASTGIT_EINVAL;
+    return fastgit_fetch_internal(repo, remote, refspec);
 }
 
 static fastgit_error_t push_via_file(fastgit_repository_t* repo, const char* remote_path, const char* refspec) {
@@ -1211,4 +1247,38 @@ fastgit_error_t fastgit_remote_set_load_shed(fastgit_remote_t* remote, const fas
     if (!remote || !ls) return FASTGIT_EINVAL;
     remote->ls = *ls;
     return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_remote_set_filter(fastgit_remote_t* remote, const fastgit_filter_list_t* filter) {
+    if (!remote || !filter) return FASTGIT_EINVAL;
+    if (remote->filter) {
+        free(remote->filter);
+    }
+    if (filter->count == 0) {
+        remote->filter = NULL;
+        remote->filter_count = 0;
+        return FASTGIT_OK;
+    }
+    remote->filter = calloc(filter->count, sizeof(fastgit_filter_spec_t));
+    if (!remote->filter) return FASTGIT_ENOMEM;
+    memcpy(remote->filter, filter->specs, filter->count * sizeof(fastgit_filter_spec_t));
+    remote->filter_count = filter->count;
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_filter_list_append(fastgit_filter_list_t* list, const fastgit_filter_spec_t* spec) {
+    if (!list || !spec) return FASTGIT_EINVAL;
+    fastgit_filter_spec_t* new_specs = realloc(list->specs, (list->count + 1) * sizeof(fastgit_filter_spec_t));
+    if (!new_specs) return FASTGIT_ENOMEM;
+    list->specs = new_specs;
+    list->specs[list->count] = *spec;
+    list->count++;
+    return FASTGIT_OK;
+}
+
+void fastgit_filter_list_free(fastgit_filter_list_t* list) {
+    if (!list) return;
+    free(list->specs);
+    list->specs = NULL;
+    list->count = 0;
 }

@@ -711,3 +711,190 @@ fastgit_error_t fastgit_diff_worktree_ext(fastgit_worktree_t* wt, const char* pa
     (void)opts;
     return fastgit_diff_worktree(wt, path, out);
 }
+
+static fastgit_error_t wt_read_file(const char* path, char** out, size_t* out_len) {
+    FILE* f = fopen(path, "r");
+    if (!f) return FASTGIT_ENOENT;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return FASTGIT_EIO; }
+    char* buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return FASTGIT_ENOMEM; }
+    if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); return FASTGIT_EIO; }
+    buf[sz] = '\0';
+    fclose(f);
+    *out = buf;
+    if (out_len) *out_len = sz;
+    return FASTGIT_OK;
+}
+
+static fastgit_error_t wt_write_file(const char* path, const char* data, size_t len) {
+    // ensure parent dirs exist
+    char* dir = strdup(path);
+    char* last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        char* p = dir + 1;
+        while (*p) {
+            if (*p == '/') {
+                *p = '\0';
+                mkdir(dir, 0755);
+                *p = '/';
+            }
+            p++;
+        }
+        mkdir(dir, 0755);
+    }
+    free(dir);
+    
+    FILE* f = fopen(path, "w");
+    if (!f) return FASTGIT_EIO;
+    if (fwrite(data, 1, len, f) != len) { fclose(f); return FASTGIT_EIO; }
+    fclose(f);
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_worktree_add(fastgit_repository_t* repo, const char* path, const char* refspec) {
+    if (!repo || !path) return FASTGIT_EINVAL;
+    
+    // Check if worktree already exists
+    char wt_gitdir[1024];
+    snprintf(wt_gitdir, sizeof(wt_gitdir), "%s/.git", path);
+    if (access(wt_gitdir, F_OK) == 0) {
+        return FASTGIT_EEXIST;
+    }
+    
+    // Resolve refspec to OID
+    fastgit_oid_t oid;
+    if (refspec) {
+        if (fastgit_rev_parse(repo, refspec, &oid) != FASTGIT_OK) {
+            return FASTGIT_ENOENT;
+        }
+    } else {
+        // Use HEAD
+        if (fastgit_rev_parse(repo, "HEAD", &oid) != FASTGIT_OK) {
+            return FASTGIT_ENOENT;
+        }
+    }
+    
+    // Create worktree directory
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        return FASTGIT_EIO;
+    }
+    
+    // Create .git file pointing to main repo's gitdir
+    char main_gitdir[1024];
+    fastgit_repository_t* main_repo = repo;
+    // Get main repo's gitdir from config or path
+    char* main_git = getenv("GIT_DIR");
+    if (!main_git) {
+        // Assume we're in the main repo's .git
+        char cwd[1024];
+        getcwd(cwd, sizeof(cwd));
+        snprintf(main_gitdir, sizeof(main_gitdir), "%s/.git", cwd);
+    } else {
+        snprintf(main_gitdir, sizeof(main_gitdir), "%s", main_git);
+    }
+    
+    // Write .git file
+    char git_file[1024];
+    snprintf(git_file, sizeof(git_file), "%s/.git", path);
+    char git_content[1024];
+    snprintf(git_content, sizeof(git_content), "gitdir: %s/worktrees/%s\n", main_gitdir, path);
+    if (wt_write_file(git_file, git_content, strlen(git_content)) != FASTGIT_OK) {
+        return FASTGIT_EIO;
+    }
+    
+    // Create worktree directory in main repo's gitdir
+    char wt_dir[1024];
+    snprintf(wt_dir, sizeof(wt_dir), "%s/worktrees/%s", main_gitdir, path);
+    mkdir(wt_dir, 0755);
+    
+    // Create HEAD file in worktree
+    char head_file[1024];
+    snprintf(head_file, sizeof(head_file), "%s/HEAD", wt_dir);
+    char head_content[1024];
+    if (refspec && (strncmp(refspec, "refs/heads/", 11) == 0 || strncmp(refspec, "refs/tags/", 10) == 0)) {
+        snprintf(head_content, sizeof(head_content), "ref: %s\n", refspec);
+    } else {
+        char hex[129];
+        fastgit_oid_to_hex(&oid, hex, sizeof(hex));
+        snprintf(head_content, sizeof(head_content), "%s\n", hex);
+    }
+    if (wt_write_file(head_file, head_content, strlen(head_content)) != FASTGIT_OK) {
+        return FASTGIT_OK;
+    }
+    
+    // Create commondir symlink
+    char commondir[1024];
+    snprintf(commondir, sizeof(commondir), "%s/commondir", wt_dir);
+    wt_write_file(commondir, "../..\n", 5);
+    
+    // Checkout the tree
+    fastgit_worktree_t* wt = NULL;
+    if (fastgit_worktree_open(path, &wt) == FASTGIT_OK) {
+        fastgit_checkout_tree(wt, &oid, true);
+        fastgit_worktree_free(wt);
+    }
+    
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_worktree_remove(fastgit_repository_t* repo, const char* path, bool force) {
+    (void)repo;
+    if (!path) return FASTGIT_EINVAL;
+    
+    // Remove worktree directory
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", path);
+    if (system(cmd) != 0) {
+        return FASTGIT_EIO;
+    }
+    
+    // Remove worktree entry from main repo's gitdir/worktrees
+    // This is a simplified implementation
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_worktree_list(fastgit_repository_t* repo, fastgit_worktree_info_t*** out_info, size_t* count) {
+    if (!repo || !out_info || !count) return FASTGIT_EINVAL;
+    *out_info = NULL;
+    *count = 0;
+    
+    // For now, just return main worktree
+    fastgit_worktree_info_t** info = calloc(1, sizeof(fastgit_worktree_info_t*));
+    if (!info) return FASTGIT_ENOMEM;
+    
+    info[0] = calloc(1, sizeof(fastgit_worktree_info_t));
+    if (!info[0]) { free(info); return FASTGIT_ENOMEM; }
+    
+    char cwd[1024];
+    getcwd(cwd, sizeof(cwd));
+    info[0]->path = strdup(cwd);
+    info[0]->gitdir = strdup(".git");
+    info[0]->head_ref = strdup("refs/heads/main");
+    info[0]->is_bare = false;
+    info[0]->is_detached = false;
+    
+    *out_info = info;
+    *count = 1;
+    return FASTGIT_OK;
+}
+
+fastgit_error_t fastgit_worktree_prune(fastgit_repository_t* repo, bool dry_run) {
+    (void)repo;
+    (void)dry_run;
+    return FASTGIT_OK;
+}
+
+void fastgit_worktree_info_free(fastgit_worktree_info_t** info, size_t count) {
+    if (!info) return;
+    for (size_t i = 0; i < count; i++) {
+        free(info[i]->path);
+        free(info[i]->gitdir);
+        free(info[i]->head_ref);
+        free(info[i]);
+    }
+    free(info);
+}

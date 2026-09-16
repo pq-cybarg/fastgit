@@ -5,6 +5,7 @@
 #include "fastgit/worktree.h"
 #include "fastgit/odb.h"
 #include "fastgit/hash.h"
+#include "fastgit/submodule.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -135,4 +136,47 @@ int fastgit_cmd_checkout(int argc, char **argv) {
     fastgit_checkout_head(wt, true);
     fastgit_reference_update(repo,"HEAD",&oid,target);
     fastgit_object_free(obj); fastgit_repository_free(repo); return 0;
+}
+
+int fastgit_cmd_worktree(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "usage: fastgit worktree <subcommand>\n"); return 1; }
+    const char* sub = argv[0];
+    fastgit_repository_t* repo = NULL;
+    if (fastgit_repository_open(".", &repo) != FASTGIT_OK) { fprintf(stderr, "fatal: not a git repository\n"); return 1; }
+    
+    if (strcmp(sub, "add") == 0 && argc >= 2) {
+        const char* path = argv[1];
+        const char* refspec = argc >= 3 ? argv[2] : NULL;
+        fastgit_error_t err = fastgit_worktree_add(repo, path, refspec);
+        if (err != FASTGIT_OK) { fprintf(stderr, "worktree add failed: %s\n", fastgit_error_string(err)); fastgit_repository_free(repo); return 1; }
+        printf("Worktree added at %s\n", path);
+    } else if (strcmp(sub, "remove") == 0 && argc >= 2) {
+        const char* path = argv[1];
+        bool force = false;
+        for (int i = 2; i < argc; i++) if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) force = true;
+        fastgit_error_t err = fastgit_worktree_remove(repo, path, force);
+        if (err != FASTGIT_OK) { fprintf(stderr, "worktree remove failed: %s\n", fastgit_error_string(err)); fastgit_repository_free(repo); return 1; }
+        printf("Worktree removed at %s\n", path);
+    } else if (strcmp(sub, "list") == 0) {
+        fastgit_worktree_info_t** info = NULL; size_t count = 0;
+        fastgit_error_t err = fastgit_worktree_list(repo, &info, &count);
+        if (err != FASTGIT_OK) { fprintf(stderr, "worktree list failed: %s\n", fastgit_error_string(err)); fastgit_repository_free(repo); return 1; }
+        for (size_t i = 0; i < count; i++) {
+            printf("%s  %s  %s\n", info[i]->path, info[i]->head_ref, info[i]->is_bare ? "(bare)" : "");
+        }
+        fastgit_worktree_info_free(info, count);
+    } else if (strcmp(sub, "prune") == 0) {
+        bool dry_run = false;
+        for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
+        fastgit_error_t err = fastgit_worktree_prune(repo, dry_run);
+        if (err != FASTGIT_OK) { fprintf(stderr, "worktree prune failed: %s\n", fastgit_error_string(err)); fastgit_repository_free(repo); return 1; }
+        printf("Worktree pruned\n");
+    } else {
+        fprintf(stderr, "fastgit worktree: unknown subcommand %s\n", sub);
+        fastgit_repository_free(repo);
+        return 1;
+    }
+    
+    fastgit_repository_free(repo);
+    return 0;
 }

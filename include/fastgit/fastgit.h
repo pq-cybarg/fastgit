@@ -129,6 +129,55 @@ typedef struct {
 void fastgit_stats_reset(void);
 fastgit_stats_t fastgit_stats_get(void);
 
+// LFS pointer file detection
+typedef struct {
+    bool is_lfs;
+    char oid[64];
+    size_t oid_len;
+    uint64_t size;
+} fastgit_lfs_pointer_t;
+
+fastgit_error_t fastgit_lfs_pointer_detect(const void* data, size_t len, fastgit_lfs_pointer_t* out);
+fastgit_error_t fastgit_lfs_pointer_create(const char* oid_hex, uint64_t size, char** out, size_t* out_len);
+
+// Commit-graph
+typedef struct fastgit_commit_graph {
+    fastgit_oid_t* oids;
+    uint32_t* parents;
+    uint32_t* generation;
+    uint64_t* commit_time;
+    size_t count;
+} fastgit_commit_graph_t;
+fastgit_error_t fastgit_commit_graph_write(fastgit_repository_t* repo);
+fastgit_error_t fastgit_commit_graph_read(fastgit_repository_t* repo, fastgit_commit_graph_t** out);
+void fastgit_commit_graph_free(fastgit_commit_graph_t* cg);
+
+// Submodules
+typedef struct fastgit_submodule_info {
+    char* name;
+    char* path;
+    char* url;
+    char* branch;
+    fastgit_oid_t oid;
+} fastgit_submodule_info_t;
+
+fastgit_error_t fastgit_submodule_add(fastgit_repository_t* repo, const char* url, const char* path, const char* branch);
+fastgit_error_t fastgit_submodule_init(fastgit_repository_t* repo, const char* name);
+fastgit_error_t fastgit_submodule_update(fastgit_repository_t* repo, const char* name, bool init);
+fastgit_error_t fastgit_submodule_foreach(fastgit_repository_t* repo, int (*callback)(fastgit_submodule_info_t* info, void* payload), void* payload);
+fastgit_error_t fastgit_submodule_status(fastgit_repository_t* repo, fastgit_submodule_info_t*** out_info, size_t* count);
+void fastgit_submodule_info_free(fastgit_submodule_info_t** info, size_t count);
+fastgit_error_t fastgit_submodule_parse_gitmodules(fastgit_repository_t* repo, fastgit_submodule_info_t*** out_info, size_t* count);
+
+// Replace refs
+fastgit_error_t fastgit_replace_ref_create(fastgit_repository_t* repo, const char* name, const fastgit_oid_t* oid, bool force);
+fastgit_error_t fastgit_replace_ref_lookup(fastgit_repository_t* repo, const char* name, fastgit_oid_t* out);
+fastgit_error_t fastgit_replace_ref_list(fastgit_repository_t* repo, char*** out, size_t* count);
+
+// Shallow fetch/clone
+fastgit_error_t fastgit_fetch_shallow(fastgit_repository_t* repo, const char* remote, const char* refspec, int depth);
+fastgit_error_t fastgit_clone_shallow(const char* url, const char* path, const char* ref, int depth);
+
 #ifdef __cplusplus
 }
 #endif

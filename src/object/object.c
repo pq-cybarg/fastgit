@@ -246,3 +246,56 @@ void fastgit_signature_to_buf(const fastgit_signature_t* sig, char** out, size_t
         *out_len = strlen(*out);
     }
 }
+
+fastgit_error_t fastgit_lfs_pointer_detect(const void* data, size_t len, fastgit_lfs_pointer_t* out) {
+    if (!data || len < 20 || !out) return FASTGIT_EINVAL;
+    const char* str = (const char*)data;
+    if (len < 8 || memcmp(str, "version ", 8) != 0) return FASTGIT_EINVAL;
+    out->is_lfs = false;
+    out->oid_len = 0;
+    out->size = 0;
+    const char* p = str;
+    const char* end = str + len;
+    while (p < end && *p != '\n' && *p != '\r') p++;
+    if (p >= end) return FASTGIT_EINVAL;
+    p++; // skip version line
+    while (p < end && *p != '\n' && *p != '\r') {
+        const char* line_end = p;
+        while (line_end < end && *line_end != '\n' && *line_end != '\r') line_end++;
+        size_t line_len = line_end - p;
+        if (line_len >= 5 && strncmp(p, "oid ", 4) == 0) {
+            const char* oid_hex = p + 4;
+            size_t oid_len = line_len - 4;
+            if (oid_len <= 64) {
+                memcpy(out->oid, oid_hex, oid_len);
+                out->oid[oid_len] = '\0';
+                out->oid_len = oid_len;
+            }
+        } else if (line_len >= 5 && strncmp(p, "size ", 5) == 0) {
+            out->size = strtoull(p + 5, NULL, 10);
+        }
+        p = line_end;
+        if (p < end && (*p == '\n' || *p == '\r')) p++;
+    }
+    if (out->oid_len > 0 && out->size > 0) {
+        out->is_lfs = true;
+        return FASTGIT_OK;
+    }
+    return FASTGIT_EINVAL;
+}
+
+fastgit_error_t fastgit_lfs_pointer_create(const char* oid_hex, uint64_t size, char** out, size_t* out_len) {
+    if (!oid_hex || !out || !out_len) return FASTGIT_EINVAL;
+    size_t oid_len = strlen(oid_hex);
+    size_t needed = 64 + oid_len + 32; // enough space for the format
+    char* buf = malloc(needed);
+    if (!buf) return FASTGIT_ENOMEM;
+    int len = snprintf(buf, needed, "version https://git-lfs.github.com/spec/v1\noid %s\nsize %llu\n", oid_hex, (unsigned long long)size);
+    if (len < 0 || len >= (int)needed) {
+        free(buf);
+        return FASTGIT_ERROR;
+    }
+    *out = buf;
+    *out_len = len;
+    return FASTGIT_OK;
+}

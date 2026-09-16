@@ -56,6 +56,9 @@ struct fastgit_pack {
     uint32_t w_count;
     uint32_t w_cap;
     uint64_t w_cur_offset;
+    /* persistent thread pool for parallel operations */
+    fastgit_thread_pool_t* pack_pool;
+    int pack_pool_ncpu;
 };
 static fastgit_obj_type_t pack_obj_type_from_git(uint32_t t){
     switch(t){ case FASTGIT_PACK_OBJ_COMMIT: return FASTGIT_OBJ_COMMIT;
@@ -252,6 +255,16 @@ fastgit_error_t fastgit_pack_create(const char* pack_file,const char* idx_file,f
     if(pack->fd<0){ free(pack->pack_file);free(pack->idx_file);free(pack);return FASTGIT_EIO; }
     pack->writing=true; pack->header.signature=FASTGIT_PACK_SIGNATURE; pack->header.version=2; pack->header.object_count=0;
     pack->w_cur_offset=12;
+    // init persistent thread pool for parallel operations
+    int ncpu=10;
+#if !defined(_WIN32)
+    long ncpus=sysconf(_SC_NPROCESSORS_ONLN);
+    if(ncpus>0) ncpu=(int)ncpus;
+#endif
+    if(ncpu>16) ncpu=16;
+    pack->pack_pool_ncpu=ncpu;
+    fastgit_thread_pool_config_t cfg={0}; cfg.worker_count=ncpu; cfg.max_queue_depth=1024;
+    fastgit_thread_pool_new(&cfg, &pack->pack_pool);
     uint32_t sig=FASTGIT_BSWAP32(pack->header.signature); uint32_t ver=FASTGIT_BSWAP32(pack->header.version); uint32_t cnt=0;
     if(write(pack->fd,&sig,4)!=4||write(pack->fd,&ver,4)!=4||write(pack->fd,&cnt,4)!=4){ close(pack->fd);free(pack->pack_file);free(pack->idx_file);free(pack);return FASTGIT_EIO;}
     *out=pack; return FASTGIT_OK;
@@ -287,6 +300,11 @@ void fastgit_pack_close(fastgit_pack_t* pack){
         if(pack->idx_file) fastgit_pack_index_create(pack->idx_file, pack);
         free(pack->w_oids); free(pack->w_crcs); free(pack->w_offsets);
         pack->w_oids=NULL; pack->w_crcs=NULL; pack->w_offsets=NULL;
+    }
+    // cleanup persistent thread pool
+    if(pack->pack_pool){
+        fastgit_thread_pool_free(pack->pack_pool);
+        pack->pack_pool=NULL;
     }
     if(pack->index) fastgit_pack_index_free(pack->index);
     if(pack->mapped){
@@ -428,22 +446,22 @@ fastgit_error_t fastgit_pack_add_objects_parallel(fastgit_pack_t* p, fastgit_obj
     pack_par_task_t* tasks=calloc(count,sizeof(*tasks));
     if(!tasks) return FASTGIT_ENOMEM;
     for(size_t i=0;i<count;i++){ tasks[i].p=p; tasks[i].t= types?types[i]:FASTGIT_OBJ_BLOB; tasks[i].d=datas[i]; tasks[i].l=lens[i]; }
-    fastgit_thread_pool_config_t cfg={0}; cfg.worker_count=8; cfg.max_queue_depth=(int)(count+16);
-    fastgit_thread_pool_t* pool=NULL; fastgit_error_t pe=fastgit_thread_pool_new(&cfg,&pool);
-    bool use_pool=(pe==FASTGIT_OK && pool!=NULL);
+    // use persistent thread pool
+    fastgit_thread_pool_t* pool=p->pack_pool;
+    bool use_pool=(pool!=NULL);
+    fastgit_error_t pe=FASTGIT_OK;
     if(use_pool){
+        // submit all tasks first (batch submit to reduce lock contention)
         for(size_t i=0;i<count;i++){
-            // retry on EBUSY with brief yield
             while(1){
                 fastgit_error_t se=fastgit_thread_pool_submit(pool, pack_par_fn, &tasks[i]);
                 if(se==FASTGIT_OK) break;
                 if(se!=FASTGIT_EBUSY){ pe=se; break; }
-                struct timespec ts={0,500000}; nanosleep(&ts,NULL);
+                struct timespec ts={0,200000}; nanosleep(&ts,NULL);
             }
             if(pe!=FASTGIT_OK) break;
         }
         if(pe==FASTGIT_OK) pe=fastgit_thread_pool_wait(pool);
-        fastgit_thread_pool_free(pool);
         if(pe!=FASTGIT_OK){
             for(size_t i=0;i<count;i++) free(tasks[i].comp);
             free(tasks); return pe;
